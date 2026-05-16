@@ -63,7 +63,9 @@ export function ParticipantsDashboard({ eventId }: { eventId: string }) {
       {eventName && (
         <h2 style={{ margin: 0, fontWeight: 500, color: "#555" }}>{eventName}</h2>
       )}
-      <h1 style={{ margin: 0 }}>Total participants</h1>
+      <h1 style={{ margin: 0 }}>
+        Total participants{eventName ? ` — ${eventName}` : ""}
+      </h1>
       {loading && count === null && <p>Loading…</p>}
       {error && <p style={{ color: "crimson" }}>Error: {error}</p>}
       {count !== null && (

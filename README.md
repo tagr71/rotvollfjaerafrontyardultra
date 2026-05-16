@@ -12,6 +12,21 @@ shows it in pickable dashboards.
 - **Number of participants** — live participant count with auto-refresh.
 - **Leaderboard** — sortable table (Place, Number, Full Name, Club,
   Country, Sex) polled every 30 s.
+- **Timer** — live race clock and per-loop counter. The start time is
+  entered in the dashboard (interpreted as Europe/Oslo wall-clock time)
+  and remembered per event ID. The main clock shows the elapsed or
+  remaining time as `dd:hh:mm:ss` and ticks every second. Two modes:
+  - **Backyard** — fixed 60-minute loops. A `mm:ss` counter counts down
+    from `60:00` to `00:00`; when it resets, the *Loops completed*
+    counter increments by 1.
+  - **Frontyard** — first loop is 30 minutes, each subsequent loop is 1
+    minute shorter. Two dropdowns shape the schedule:
+    - *Hold loop length after loop* (1–29): from this loop onwards every
+      loop reuses the same length (e.g. `Loop 17 (14 min)` keeps all
+      following loops at 14 min).
+    - *Maximum number of loops* (must be greater than the hold loop):
+      the race ends after this many loops. The option list is filtered
+      automatically so it always exceeds the hold-loop value.
 
 The front page lets you type a RaceResult event ID, pick a dashboard
 from a dropdown, and open it. A **← Back** button returns to the front
