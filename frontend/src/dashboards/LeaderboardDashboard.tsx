@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { BACKYARD_LOOP_KM, FRONTYARD_LOOP_KM, modeKey, type Mode } from "./timerCore";
+import { BACKYARD_LOOP_KM, FRONTYARD_LOOP_KM, useTimerSettings } from "./timerCore";
 
 type ResultRow = {
   place: number | null;
@@ -20,15 +20,6 @@ type ResultRow = {
   total: string;
 };
 type ResultsResponse = { eventName?: string; rows: ResultRow[] };
-
-/** Parse "H:mm:ss", "mm:ss" or "ss" into seconds; null when unparseable. */
-function parseHms(s: string): number | null {
-  if (!s) return null;
-  const m = /^(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,]\d+)?$/.exec(s.trim());
-  if (!m) return null;
-  const h = m[1] ? parseInt(m[1], 10) : 0;
-  return h * 3600 + parseInt(m[2], 10) * 60 + parseInt(m[3], 10);
-}
 
 type DerivedRow = ResultRow & { laps: number | null; distanceKm: number | null };
 
@@ -121,6 +112,7 @@ function compare(a: DerivedRow, b: DerivedRow, key: SortKey, dir: SortDir): numb
 }
 
 export function LeaderboardDashboard({ eventId }: { eventId: string }) {
+  const { mode } = useTimerSettings(eventId);
   const [rows, setRows] = useState<ResultRow[]>([]);
   const [eventName, setEventName] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
@@ -165,32 +157,25 @@ export function LeaderboardDashboard({ eventId }: { eventId: string }) {
   }, [eventId]);
 
   const sortedRows = useMemo(() => {
-    // Backyard: each loop starts on the hour, so a runner's `total` (wall
-    // clock time from race start) directly yields completed loops:
-    //   lapsCompleted = floor(total / 3600)
-    // Prefer the API's own `lapsCompleted` when present, then fall back to
-    // the per-runner total, and finally to leader-minus-lapsBehind.
-    const leader = rows.find((r) => r.totalRank === 1);
-    const leaderTotalSec = leader ? parseHms(leader.total) : null;
-    const leaderLapsFromTotal =
-      leaderTotalSec !== null ? Math.floor(leaderTotalSec / 3600) : null;
-    const mode: Mode =
-      (localStorage.getItem(modeKey(eventId)) as Mode | null) ?? "backyard";
+    // Lap count comes straight from RaceResult's `NumberOfLaps` field
+    // (exposed by the backend as `lapsCompleted`). We don't try to derive
+    // it from the cumulative `total` time — that depends on per-lap times
+    // which we don't have, and the schedule differs between backyard and
+    // frontyard. Last-resort fallback: leader-minus-`lapsBehind`, which
+    // only works when the API supplies `lapsBehind` (also rare in
+    // frontyard).
     const loopKm = mode === "frontyard" ? FRONTYARD_LOOP_KM : BACKYARD_LOOP_KM;
+    const leader = rows.find((r) => r.totalRank === 1);
+    const leaderLaps = leader?.lapsCompleted ?? null;
 
     const derived: DerivedRow[] = rows.map((r) => {
       let laps: number | null;
       if (r.lapsCompleted !== null) {
         laps = r.lapsCompleted;
+      } else if (leaderLaps !== null && r.lapsBehind !== null) {
+        laps = Math.max(0, leaderLaps - r.lapsBehind);
       } else {
-        const t = parseHms(r.total);
-        if (t !== null) {
-          laps = Math.max(0, Math.floor(t / 3600));
-        } else if (leaderLapsFromTotal !== null) {
-          laps = Math.max(0, leaderLapsFromTotal - (r.lapsBehind ?? 0));
-        } else {
-          laps = null;
-        }
+        laps = null;
       }
       return {
         ...r,
@@ -199,7 +184,7 @@ export function LeaderboardDashboard({ eventId }: { eventId: string }) {
       };
     });
     return derived.sort((a, b) => compare(a, b, sortKey, sortDir));
-  }, [rows, sortKey, sortDir, eventId]);
+  }, [rows, sortKey, sortDir, mode]);
 
   function toggleSort(key: SortKey) {
     if (key === sortKey) {

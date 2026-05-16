@@ -113,7 +113,7 @@ export function TimerSetupDashboard({ eventId, eventName, eventLocation }: { eve
     which: "pink" | "green" | "yellow",
     next: number,
   ) {
-    const clamped = Math.max(1, Math.min(FRONTYARD_MAX_CAP, next));
+    const clamped = Math.max(1, Math.min(fyMax, next));
     if (which === "pink") {
       setJerseyPink(clamped);
       localStorage.setItem(jerseyPinkKey(eventId), String(clamped));
@@ -130,6 +130,8 @@ export function TimerSetupDashboard({ eventId, eventName, eventLocation }: { eve
   for (let i = FRONTYARD_LOCK_MIN; i <= FRONTYARD_LOCK_MAX; i += 1) lockOptions.push(i);
   const maxOptions: number[] = [];
   for (let i = fyLock + 1; i <= FRONTYARD_MAX_CAP; i += 1) maxOptions.push(i);
+  const jerseyOptions: number[] = [];
+  for (let i = 1; i <= fyMax; i += 1) jerseyOptions.push(i);
 
   return (
     <section
@@ -267,36 +269,45 @@ export function TimerSetupDashboard({ eventId, eventName, eventLocation }: { eve
           </label>
           <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
             <span>Pink jersey at loop</span>
-            <input
-              type="number"
-              min={1}
-              max={FRONTYARD_MAX_CAP}
-              value={jerseyPink}
+            <select
+              value={Math.min(jerseyPink, fyMax)}
               onChange={(e) => onJerseyChange("pink", parseInt(e.target.value, 10))}
               style={{ padding: "0.4rem 0.6rem", fontSize: "1rem" }}
-            />
+            >
+              {jerseyOptions.map((n) => (
+                <option key={n} value={n}>
+                  Loop {n}
+                </option>
+              ))}
+            </select>
           </label>
           <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
             <span>Green jersey at loop</span>
-            <input
-              type="number"
-              min={1}
-              max={FRONTYARD_MAX_CAP}
-              value={jerseyGreen}
+            <select
+              value={Math.min(jerseyGreen, fyMax)}
               onChange={(e) => onJerseyChange("green", parseInt(e.target.value, 10))}
               style={{ padding: "0.4rem 0.6rem", fontSize: "1rem" }}
-            />
+            >
+              {jerseyOptions.map((n) => (
+                <option key={n} value={n}>
+                  Loop {n}
+                </option>
+              ))}
+            </select>
           </label>
           <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
             <span>Yellow &amp; Winner at loop</span>
-            <input
-              type="number"
-              min={1}
-              max={FRONTYARD_MAX_CAP}
-              value={jerseyYellow}
+            <select
+              value={Math.min(jerseyYellow, fyMax)}
               onChange={(e) => onJerseyChange("yellow", parseInt(e.target.value, 10))}
               style={{ padding: "0.4rem 0.6rem", fontSize: "1rem" }}
-            />
+            >
+              {jerseyOptions.map((n) => (
+                <option key={n} value={n}>
+                  Loop {n}
+                </option>
+              ))}
+            </select>
           </label>
         </div>
       )}

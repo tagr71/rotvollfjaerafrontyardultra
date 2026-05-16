@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   BACKYARD_LOOP_KM,
   FRONTYARD_LOOP_KM,
@@ -68,6 +68,49 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
   const backyardDistance = backyardCompleted * BACKYARD_LOOP_KM;
   const frontyardCompleted = beforeStart ? 0 : fy.loopsCompleted;
   const frontyardDistance = frontyardCompleted * FRONTYARD_LOOP_KM;
+
+  // Poll the leaderboard every 30 s and derive how many runners are still in
+  // the current round vs. how many made it through the previous round.
+  //   thisRound     = runners whose lapsCompleted == max (the survivors who
+  //                   are about to go out for / are currently on the next loop)
+  //   previousRound = runners whose lapsCompleted == max - 1 (those who
+  //                   completed the round before but didn't make this one)
+  const [runnersThisRound, setRunnersThisRound] = useState<number | null>(null);
+  const [runnersPrevRound, setRunnersPrevRound] = useState<number | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        const res = await fetch(`/api/results?event_id=${encodeURIComponent(eventId)}`);
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          rows?: { lapsCompleted: number | null }[];
+        };
+        if (cancelled) return;
+        const laps = (data.rows ?? [])
+          .map((r) => r.lapsCompleted)
+          .filter((n): n is number => typeof n === "number");
+        if (laps.length === 0) {
+          setRunnersThisRound(0);
+          setRunnersPrevRound(0);
+          return;
+        }
+        const max = Math.max(...laps);
+        setRunnersThisRound(laps.filter((n) => n === max).length);
+        setRunnersPrevRound(laps.filter((n) => n === max - 1).length);
+      } catch {
+        // Leave the previous counts in place on transient errors.
+      }
+    }
+    load();
+    const t = window.setInterval(load, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [eventId]);
+  const thisRoundValue = runnersThisRound === null ? "—" : String(runnersThisRound);
+  const prevRoundValue = runnersPrevRound === null ? "—" : String(runnersPrevRound);
 
   /** Length (min) of the loop after `currentLoopNumber` in frontyard, or null if none. */
   function nextFrontyardLoopMin(currentLoopNumber: number): number | null {
@@ -264,6 +307,8 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
                 valueColor="black"
                 labelColor="black"
               />
+              <StatCard label="Runners this round" value={thisRoundValue} valueColor="black" labelColor="black" />
+              <StatCard label="Runners previous round" value={prevRoundValue} valueColor="black" labelColor="black" />
             </div>
           )}
 
@@ -316,6 +361,8 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
                     value="30:00"
                   />
                   <JerseyCard loopNumber={1} />
+                  <StatCard label="Runners this round" value={thisRoundValue} valueColor="black" labelColor="black" />
+                  <StatCard label="Runners previous round" value={prevRoundValue} valueColor="black" labelColor="black" />
                 </>
               ) : fy.finished ? (
                 <>
@@ -341,6 +388,8 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
                     valueColor="#117a3a"
                   />
                   <JerseyCard loopNumber={null} />
+                  <StatCard label="Runners this round" value={thisRoundValue} valueColor="black" labelColor="black" />
+                  <StatCard label="Runners previous round" value={prevRoundValue} valueColor="black" labelColor="black" />
                 </>
               ) : (
                 <>
@@ -387,6 +436,8 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
                     labelColor="black"
                   />
                   <JerseyCard loopNumber={fy.loopNumber} />
+                  <StatCard label="Runners this round" value={thisRoundValue} valueColor="black" labelColor="black" />
+                  <StatCard label="Runners previous round" value={prevRoundValue} valueColor="black" labelColor="black" />
                 </>
               )}
             </div>

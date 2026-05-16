@@ -158,13 +158,39 @@ def _count_rows(payload: Any) -> int:
 
 
 _NAME_BIB_RE = re.compile(r"\s*\[\d+\]\s*$")
-_FLAG_RE = re.compile(r"/flags/([A-Za-z]{2,3})\.svg", re.IGNORECASE)
+_FLAG_RE = re.compile(
+    r"(?:/flags/|StateFlag_)([A-Za-z]{2,3})\.(?:svg|png|jpg)",
+    re.IGNORECASE,
+)
 _RANK_RE = re.compile(r"^\s*(-?\d+)\s*\.?\s*(.*?)\s*$")
 _LAPS_BEHIND_RE = re.compile(r"^\s*(-?\d+)\s*Runde", re.IGNORECASE)
 _SEX_MAP = {
     "mann": "M", "male": "M", "m": "M", "herre": "M",
     "kvinne": "K", "female": "K", "f": "K", "dame": "K", "w": "K",
 }
+
+
+def _parse_hms(s: str) -> int | None:
+    """Parse a RaceResult time cell ("H:mm:ss", "mm:ss", or "ss") to seconds.
+    Returns None when the cell is empty or unparseable."""
+    if not s:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    m = re.match(r"^(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,]\d+)?$", s)
+    if not m:
+        return None
+    h = int(m.group(1)) if m.group(1) else 0
+    return h * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+
+
+def _format_hms(seconds: int) -> str:
+    """Format a non-negative integer second count as "H:mm:ss" / "mm:ss"."""
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def _extract_country(raw_flag: str) -> str:
@@ -192,7 +218,13 @@ def _flatten_results(payload: dict[str, Any]) -> list[dict[str, object]]:
         return -1
 
     bib_i = find_index("BIB")
-    name_i = find_index("DisplayNameBib", "DisplayName", "FullName", "Name")
+    name_i = find_index(
+        "DisplayNameBib",
+        "DisplayNameOrTeam",
+        "DisplayName",
+        "FullName",
+        "Name",
+    )
     # Some lists publish a custom name formula like
     # `[DisplayName] & " [" & [BIB] & "]"` instead of a bare column. Detect
     # that by looking for a substring referencing [DisplayName] or [FullName].
@@ -216,23 +248,34 @@ def _flatten_results(payload: dict[str, Any]) -> list[dict[str, object]]:
     )
     # Some lists use a custom rank formula like
     # `if([FinalRank]=1;[FinalRankp];"DNF")` that returns "1." or "DNF".
+    # Frontyard LIVE uses `if([STARTED]=1;AutoRank;)`, which gives a bare
+    # integer; detect via the `AutoRank` substring. The Backyard Ultra
+    # template wraps the rank in `BackyardUltra_OrStatus([...Rank.p])`.
     if rank_i == -1:
         for i, f in enumerate(fields):
             if isinstance(f, str) and (
-                "[FinalRankp]" in f or "[FinalRank]" in f or "Rankp]" in f
+                "[FinalRankp]" in f
+                or "[FinalRank]" in f
+                or "Rankp]" in f
+                or "Rank.p]" in f
+                or "AutoRank" in f
+                or "BackyardUltra_OrStatus" in f
             ):
                 rank_i = i
                 break
     place_i = find_index("TotalRank", "Rank", "Place")
     if place_i == -1:
         place_i = rank_i
-    club_i = find_index("ClubOrCity", "Club", "City")
-    country_i = find_index("NATION.FLAG", "Nation", "Country")
+    club_i = find_index("ClubOrCity", "DisplayClubOrNames", "Club", "City")
+    country_i = find_index(
+        "NATION.FLAG", "NationOrStateFlag", "NationOrState", "Nation", "Country"
+    )
     total_rank_i = find_index("TotalRank", "Rank")
     if total_rank_i == -1:
         total_rank_i = rank_i
     laps_i = find_index(
         "NumberOfLaps",
+        "BackyardUltra_YardCount",
         "LapsCompleted",
         "Laps",
         "LapCount",
@@ -240,16 +283,36 @@ def _flatten_results(payload: dict[str, Any]) -> list[dict[str, object]]:
         "Rounds",
     )
     last_lap_i = find_index(
-        "LastLap", "LastLapTime", "LastRound", "LastRoundTime", "LastSplit"
+        "LastLap",
+        "BackyardUltra_LastYard",
+        "LastLapTime",
+        "LastRound",
+        "LastRoundTime",
+        "LastSplit",
     )
     fastest_lap_i = find_index(
-        "FastestLap", "BestLap", "FastestRound", "BestRound", "MinLap"
+        "FastestLap",
+        "BackyardUltra_FastestYard",
+        "BestLap",
+        "FastestRound",
+        "BestRound",
+        "MinLap",
     )
     slowest_lap_i = find_index(
-        "SlowestLap", "WorstLap", "SlowestRound", "WorstRound", "MaxLap"
+        "SlowestLap",
+        "BackyardUltra_SlowestYard",
+        "WorstLap",
+        "SlowestRound",
+        "WorstRound",
+        "MaxLap",
     )
     average_lap_i = find_index(
-        "AverageLap", "AvgLap", "AverageRound", "AvgRound", "MeanLap"
+        "AverageLap",
+        "BackyardUltra_AverageYard",
+        "AvgLap",
+        "AverageRound",
+        "AvgRound",
+        "MeanLap",
     )
     status_i = find_index("Status", "StatusText", "Statustext", "State", "RaceStatus")
     # Gap-to-leader cell. RaceResult typically wraps the formula in a verbose
@@ -261,8 +324,9 @@ def _flatten_results(payload: dict[str, Any]) -> list[dict[str, object]]:
                 gap_i = i
                 break
     # Total race time cell (typically a "iif([TIMESET1]=0;...;[Total])" formula,
-    # or a "WithStatus([TIME])" wrapper on result lists).
-    total_i = find_index("Total", "TotalTime")
+    # or a "WithStatus([TIME])" wrapper on result lists; the Backyard Ultra
+    # template publishes it as `BackyardUltra_YardSum`).
+    total_i = find_index("Total", "BackyardUltra_YardSum", "TotalTime")
     if total_i == -1:
         for i, f in enumerate(fields):
             if isinstance(f, str) and (
@@ -348,6 +412,37 @@ def _flatten_results(payload: dict[str, Any]) -> list[dict[str, object]]:
     for idx, row in enumerate(rows, start=1):
         if row.get("totalRank") is None:
             row["totalRank"] = idx
+
+    # Some lists (notably the frontyard LIVE template) don't publish
+    # `NumberOfLaps`. Derive laps from `Total / AverageLap` when both are
+    # present — here `Total` is the sum of completed lap times.
+    laps_missing = laps_i == -1 or all(r.get("lapsCompleted") is None for r in rows)
+    if laps_missing:
+        for row in rows:
+            total_sec = _parse_hms(str(row.get("total") or ""))
+            avg_sec = _parse_hms(str(row.get("averageLap") or ""))
+            if total_sec is not None and avg_sec and avg_sec > 0:
+                row["lapsCompleted"] = round(total_sec / avg_sec)
+
+    # Some lists don't publish `Gap`. Derive it from the leader's total when
+    # both runner and leader have a usable `total` time.
+    if gap_i == -1 or all(not r.get("gap") for r in rows):
+        leader_total: int | None = None
+        for row in rows:
+            if row.get("totalRank") == 1:
+                leader_total = _parse_hms(str(row.get("total") or ""))
+                break
+        if leader_total is not None:
+            for row in rows:
+                if row.get("totalRank") == 1:
+                    row["gap"] = "-"
+                    continue
+                t = _parse_hms(str(row.get("total") or ""))
+                if t is None:
+                    continue
+                diff = t - leader_total
+                row["gap"] = ("+" if diff >= 0 else "-") + _format_hms(abs(diff))
+
     return rows
 
 
