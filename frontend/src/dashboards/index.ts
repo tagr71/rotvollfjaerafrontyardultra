@@ -1,8 +1,10 @@
 import type { ComponentType } from "react";
 import { ParticipantsDashboard } from "./ParticipantsDashboard";
 import { LeaderboardDashboard } from "./LeaderboardDashboard";
+import { TimerDashboard } from "./TimerDashboard";
+import { TimerSetupDashboard } from "./TimerSetupDashboard";
 
-export type DashboardProps = { eventId: string };
+export type DashboardProps = { eventId: string; eventName?: string };
 
 export type Dashboard = {
   id: string;
@@ -20,5 +22,15 @@ export const dashboards: Dashboard[] = [
     id: "leaderboard",
     title: "Leaderboard",
     component: LeaderboardDashboard,
+  },
+  {
+    id: "timer-setup",
+    title: "Timer set-up",
+    component: TimerSetupDashboard,
+  },
+  {
+    id: "timer",
+    title: "Timer dashboard",
+    component: TimerDashboard,
   },
 ];

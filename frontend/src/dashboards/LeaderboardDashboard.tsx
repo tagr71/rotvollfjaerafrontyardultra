@@ -12,16 +12,59 @@ type ResultsResponse = { eventName?: string; rows: ResultRow[] };
 
 const REFRESH_MS = 30_000;
 
+/** Common IOC / ISO alpha-3 → ISO alpha-2 country codes used in running events. */
+const ALPHA3_TO_ALPHA2: Record<string, string> = {
+  AFG: "AF", ALB: "AL", ALG: "DZ", AND: "AD", ANG: "AO", ARG: "AR", ARM: "AM",
+  AUS: "AU", AUT: "AT", AZE: "AZ", BAH: "BS", BAN: "BD", BAR: "BB", BDI: "BI",
+  BEL: "BE", BEN: "BJ", BER: "BM", BHU: "BT", BIH: "BA", BLR: "BY", BOL: "BO",
+  BOT: "BW", BRA: "BR", BRN: "BH", BRU: "BN", BUL: "BG", BUR: "BF", CAF: "CF",
+  CAM: "KH", CAN: "CA", CAY: "KY", CGO: "CG", CHA: "TD", CHI: "CL", CHN: "CN",
+  CIV: "CI", CMR: "CM", COD: "CD", COL: "CO", COM: "KM", CPV: "CV", CRC: "CR",
+  CRO: "HR", CUB: "CU", CYP: "CY", CZE: "CZ", DEN: "DK", DJI: "DJ", DMA: "DM",
+  DOM: "DO", ECU: "EC", EGY: "EG", ERI: "ER", ESA: "SV", ESP: "ES", EST: "EE",
+  ETH: "ET", FAR: "FO", FIJ: "FJ", FIN: "FI", FRA: "FR", FSM: "FM", GAB: "GA",
+  GAM: "GM", GBR: "GB", GBS: "GW", GEO: "GE", GEQ: "GQ", GER: "DE", GHA: "GH",
+  GRE: "GR", GRN: "GD", GUA: "GT", GUI: "GN", GUM: "GU", GUY: "GY", HAI: "HT",
+  HKG: "HK", HON: "HN", HUN: "HU", INA: "ID", IND: "IN", IRI: "IR", IRL: "IE",
+  IRQ: "IQ", ISL: "IS", ISR: "IL", ISV: "VI", ITA: "IT", IVB: "VG", JAM: "JM",
+  JOR: "JO", JPN: "JP", KAZ: "KZ", KEN: "KE", KGZ: "KG", KIR: "KI", KOR: "KR",
+  KOS: "XK", KSA: "SA", KUW: "KW", LAO: "LA", LAT: "LV", LBA: "LY", LBR: "LR",
+  LCA: "LC", LES: "LS", LIB: "LB", LIE: "LI", LTU: "LT", LUX: "LU", MAD: "MG",
+  MAR: "MA", MAS: "MY", MAW: "MW", MDA: "MD", MDV: "MV", MEX: "MX", MGL: "MN",
+  MKD: "MK", MLI: "ML", MLT: "MT", MNE: "ME", MON: "MC", MOZ: "MZ", MRI: "MU",
+  MTN: "MR", MYA: "MM", NAM: "NA", NCA: "NI", NED: "NL", NEP: "NP", NGR: "NG",
+  NIG: "NE", NOR: "NO", NRU: "NR", NZL: "NZ", OMA: "OM", PAK: "PK", PAN: "PA",
+  PAR: "PY", PER: "PE", PHI: "PH", PLE: "PS", PLW: "PW", PNG: "PG", POL: "PL",
+  POR: "PT", PRK: "KP", PUR: "PR", QAT: "QA", ROU: "RO", RSA: "ZA", RUS: "RU",
+  RWA: "RW", SAM: "WS", SEN: "SN", SEY: "SC", SGP: "SG", SKN: "KN", SLE: "SL",
+  SLO: "SI", SMR: "SM", SOL: "SB", SOM: "SO", SRB: "RS", SRI: "LK", STP: "ST",
+  SUD: "SD", SUI: "CH", SUR: "SR", SVK: "SK", SWE: "SE", SWZ: "SZ", SYR: "SY",
+  TAN: "TZ", TGA: "TO", THA: "TH", TJK: "TJ", TKM: "TM", TLS: "TL", TOG: "TG",
+  TPE: "TW", TRI: "TT", TUN: "TN", TUR: "TR", TUV: "TV", UAE: "AE", UGA: "UG",
+  UKR: "UA", URU: "UY", USA: "US", UZB: "UZ", VAN: "VU", VEN: "VE", VIE: "VN",
+  VIN: "VC", YEM: "YE", ZAM: "ZM", ZIM: "ZW",
+};
+
+/** Returns the ISO alpha-2 code (lowercase) for use with flag image CDNs,
+ * or an empty string when no flag can be resolved. */
+function countryAlpha2(code: string): string {
+  if (!code) return "";
+  const up = code.trim().toUpperCase();
+  const alpha2 = up.length === 3 ? ALPHA3_TO_ALPHA2[up] ?? "" : up;
+  if (alpha2.length !== 2 || !/^[A-Z]{2}$/.test(alpha2)) return "";
+  return alpha2.toLowerCase();
+}
+
 type SortKey = keyof ResultRow;
 type SortDir = "asc" | "desc";
 
 const columns: { key: SortKey; label: string; numeric?: boolean }[] = [
   { key: "place", label: "Place", numeric: true },
-  { key: "bib", label: "Number", numeric: true },
+  { key: "bib", label: "Bib", numeric: true },
   { key: "name", label: "Full Name" },
   { key: "club", label: "Club" },
   { key: "country", label: "Country" },
-  { key: "sex", label: "Sex" },
+  { key: "sex", label: "Gender" },
 ];
 
 function compare(a: ResultRow, b: ResultRow, key: SortKey, dir: SortDir): number {
@@ -117,7 +160,9 @@ export function LeaderboardDashboard({ eventId }: { eventId: string }) {
       {eventName && (
         <h2 style={{ margin: 0, fontWeight: 500, color: "#555" }}>{eventName}</h2>
       )}
-      <h1 style={{ margin: 0 }}>Leaderboard</h1>
+      <h1 style={{ margin: 0 }}>
+        Leaderboard{eventName ? ` — ${eventName}` : ""}
+      </h1>
 
       {loading && rows.length === 0 && <p>Loading…</p>}
       {error && <p style={{ color: "crimson" }}>Error: {error}</p>}
@@ -165,7 +210,21 @@ export function LeaderboardDashboard({ eventId }: { eventId: string }) {
                 <td style={tdNum}>{r.bib}</td>
                 <td style={td}>{r.name}</td>
                 <td style={td}>{r.club}</td>
-                <td style={td}>{r.country}</td>
+                <td style={td}>
+                  {countryAlpha2(r.country) ? (
+                    <img
+                      src={`https://flagcdn.com/24x18/${countryAlpha2(r.country)}.png`}
+                      srcSet={`https://flagcdn.com/48x36/${countryAlpha2(r.country)}.png 2x, https://flagcdn.com/72x54/${countryAlpha2(r.country)}.png 3x`}
+                      width={24}
+                      height={18}
+                      alt={r.country}
+                      title={r.country}
+                      style={{ verticalAlign: "middle", borderRadius: 2 }}
+                    />
+                  ) : (
+                    r.country
+                  )}
+                </td>
                 <td style={td}>{r.sex}</td>
               </tr>
             ))}

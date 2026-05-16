@@ -1,10 +1,23 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { dashboards } from "./dashboards";
 
 const EVENT_ID_KEY = "raceresult.eventId";
 const DASHBOARD_KEY = "raceresult.dashboard";
+const CLUB_NAME = "HELL ULTRALØPERKLUBB";
 
 type Selection = { eventId: string; dashboardId: string };
+
+/** Drop a replacement file at `frontend/public/logo.svg` (or `.png`) to
+ * change the logo without touching this component. */
+function Logo({ style }: { style?: React.CSSProperties }) {
+  return (
+    <img
+      src="/logo.png"
+      alt="Logo"
+      style={{ height: "200px", width: "auto", display: "block", ...style }}
+    />
+  );
+}
 
 export function App() {
   const [selection, setSelection] = useState<Selection | null>(null);
@@ -14,6 +27,27 @@ export function App() {
   const [dashboardId, setDashboardId] = useState<string>(
     () => localStorage.getItem(DASHBOARD_KEY) ?? dashboards[0].id,
   );
+  const [eventName, setEventName] = useState<string>("");
+
+  // Fetch the event name for the footer whenever a dashboard is active.
+  useEffect(() => {
+    if (!selection) {
+      setEventName("");
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/participants/count?event_id=${encodeURIComponent(selection.eventId)}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((data: { eventName?: string }) => {
+        if (!cancelled) setEventName(data.eventName ?? "");
+      })
+      .catch(() => {
+        if (!cancelled) setEventName("");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selection]);
 
   function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -65,6 +99,20 @@ export function App() {
           <span style={{ color: "#666" }}>
             {active.title} · event {selection.eventId}
           </span>
+          <Logo style={{ marginLeft: "auto" }} />
+        </div>
+      )}
+
+      {!selection && (
+        <div
+          style={{
+            padding: "0.75rem 1rem",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "flex-end",
+          }}
+        >
+          <Logo />
         </div>
       )}
 
@@ -145,7 +193,9 @@ export function App() {
           </form>
         )}
 
-        {selection && active && <active.component eventId={selection.eventId} />}
+        {selection && active && (
+          <active.component eventId={selection.eventId} eventName={eventName} />
+        )}
 
         {selection && !active && (
           <p style={{ color: "crimson" }}>
@@ -153,6 +203,24 @@ export function App() {
           </p>
         )}
       </div>
+
+      <footer
+        style={{
+          padding: "0.6rem 1rem",
+          background: "#fafafa",
+          borderTop: "1px solid #ddd",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: "0.75rem",
+          fontSize: "0.85rem",
+          color: "#555",
+          letterSpacing: "0.04em",
+        }}
+      >
+        <span style={{ fontWeight: 600 }}>{CLUB_NAME}</span>
+        <span style={{ textAlign: "right" }}>{eventName}</span>
+      </footer>
     </main>
   );
 }
