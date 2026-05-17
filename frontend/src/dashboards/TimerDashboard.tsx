@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BACKYARD_LOOP_KM,
   FRONTYARD_LOOP_KM,
@@ -90,6 +90,51 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
     };
   }, [eventId]);
 
+  // Fetch jersey standings once + every 30 s, used to display the current
+  // pink/green/yellow holders (Women + Men) after the last completed loop.
+  // Only frontyard events publish jersey lists, so backyard returns empty.
+  type HolderEntry = {
+    bib: string;
+    name: string;
+    sex: string;
+    points?: number;
+    total?: string;
+    totalSec?: number;
+    lapsCompleted?: number;
+    perLoop?: { loop: number; points?: number }[];
+  };
+  type JerseysFetchPayload = {
+    green: HolderEntry[];
+    pink: HolderEntry[];
+    yellow: HolderEntry[];
+  };
+  const [jerseyData, setJerseyData] = useState<JerseysFetchPayload | null>(null);
+  useEffect(() => {
+    if (mode !== "frontyard") {
+      setJerseyData(null);
+      return;
+    }
+    let cancelled = false;
+    let t: number | null = null;
+    async function load() {
+      try {
+        const res = await fetch(`/api/jerseys?event_id=${encodeURIComponent(eventId)}`);
+        if (!res.ok) return;
+        const d = (await res.json()) as JerseysFetchPayload;
+        if (cancelled) return;
+        setJerseyData(d);
+      } catch {
+        // Leave previous values in place on transient errors.
+      }
+    }
+    load();
+    t = window.setInterval(load, 30_000);
+    return () => {
+      cancelled = true;
+      if (t !== null) window.clearInterval(t);
+    };
+  }, [eventId, mode]);
+
   // Playback: when the race is finished, the user can step loop-by-loop.
   // `viewLoop` is null while live; a number 1..maxLoop while scrubbing.
   const { viewLoop, setViewLoop } = useViewLoop(eventId);
@@ -134,6 +179,67 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
   const backyardDistance = backyardCompleted * BACKYARD_LOOP_KM;
   const frontyardCompleted = beforeStart ? 0 : fy.loopsCompleted;
   const frontyardDistance = frontyardCompleted * FRONTYARD_LOOP_KM;
+
+  /** Snapshot loop for the Dashboard's jersey holder cards. In live mode
+   * this follows the race clock (so the cards advance as soon as the
+   * timer ticks over to a new loop); in replay it follows the scrubber.
+   * `frontyardCompleted` already reflects both cases. */
+  const holderSnapshotLoop = mode === "frontyard" ? frontyardCompleted : 0;
+
+  /** Top 3 holders per sex for each jersey, capped at the configured
+   * jersey end-loop and the snapshot loop (live timer or replay). */
+  const jerseyHolders = useMemo(() => {
+    type Holder = { name: string; value: string };
+    const result = {
+      pink: { K: [] as Holder[], M: [] as Holder[] },
+      green: { K: [] as Holder[], M: [] as Holder[] },
+      yellow: { K: [] as Holder[], M: [] as Holder[] },
+    };
+    if (!jerseyData || holderSnapshotLoop < 1) return result;
+    // Combine sex info from green/yellow so we can classify pink entries.
+    const sexLookup = new Map<string, string>();
+    for (const e of jerseyData.green) {
+      if (e.sex === "M" || e.sex === "K") sexLookup.set(e.bib, e.sex);
+    }
+    for (const e of jerseyData.yellow) {
+      if (e.sex === "M" || e.sex === "K") sexLookup.set(e.bib, e.sex);
+    }
+    const resolveSex = (e: HolderEntry) =>
+      e.sex === "M" || e.sex === "K" ? e.sex : sexLookup.get(e.bib) ?? "";
+    const sumUpto = (e: HolderEntry, cap: number) =>
+      (e.perLoop ?? [])
+        .filter((p) => p.loop <= cap)
+        .reduce((acc, p) => acc + (p.points ?? 0), 0);
+    const pinkCap = Math.min(jerseyPink, holderSnapshotLoop);
+    const greenCap = Math.min(jerseyGreen, holderSnapshotLoop);
+    for (const sex of ["K", "M"] as const) {
+      result.pink[sex] = jerseyData.pink
+        .filter((e) => resolveSex(e) === sex)
+        .map((e) => ({ e, pts: sumUpto(e, pinkCap) }))
+        .filter((x) => x.pts > 0)
+        .sort((a, b) => b.pts - a.pts)
+        .slice(0, 3)
+        .map((x) => ({ name: x.e.name, value: `${x.pts} p` }));
+      result.green[sex] = jerseyData.green
+        .filter((e) => resolveSex(e) === sex)
+        .map((e) => ({ e, pts: sumUpto(e, greenCap) }))
+        .filter((x) => x.pts > 0)
+        .sort((a, b) => b.pts - a.pts)
+        .slice(0, 3)
+        .map((x) => ({ name: x.e.name, value: `${x.pts} p` }));
+      result.yellow[sex] = jerseyData.yellow
+        .filter((e) => {
+          if (resolveSex(e) !== sex) return false;
+          if ((e.totalSec ?? 0) <= 0) return false;
+          const lc = typeof e.lapsCompleted === "number" ? e.lapsCompleted : 0;
+          return lc >= holderSnapshotLoop;
+        })
+        .sort((a, b) => (a.totalSec ?? 0) - (b.totalSec ?? 0))
+        .slice(0, 3)
+        .map((e) => ({ name: e.name, value: e.total ?? "—" }));
+    }
+    return result;
+  }, [jerseyData, holderSnapshotLoop, jerseyPink, jerseyGreen]);
 
   // Derive the runners-this-loop / completed-past-loop counters. The
   // detailed semantics are documented inline below; in short:
@@ -227,6 +333,150 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
           )}
         </div>
       </div>
+    );
+  }
+
+  /** One card per jersey color showing the current Women + Men holders
+   * (name + total points / total time) after the last completed loop.
+   * Used in frontyard mode so spectators can see who is winning each
+   * competition without leaving the Dashboard. */
+  function JerseyHoldersRow() {
+    const cards: {
+      key: "pink" | "green" | "yellow";
+      label: string;
+      bg: string;
+      valueHeader: string;
+      endsAt: number;
+      img: string;
+    }[] = [
+      { key: "pink", label: "Pink jersey", bg: "#fce7f3", valueHeader: "Total points", endsAt: jerseyPink, img: "/rosa.png" },
+      { key: "green", label: "Green jersey", bg: "#dcfce7", valueHeader: "Total points", endsAt: jerseyGreen, img: "/gr\u00f8nn.png" },
+      { key: "yellow", label: "Yellow jersey", bg: "#fef9c3", valueHeader: "Overall time", endsAt: jerseyYellow, img: "/gul.png" },
+    ];
+    return (
+      <>
+        {cards.map((c) => {
+          const h = jerseyHolders[c.key];
+          const subtitle =
+            holderSnapshotLoop >= 1
+              ? `after ${Math.min(holderSnapshotLoop, c.endsAt)} of ${c.endsAt} loops`
+              : `no loops completed yet (of ${c.endsAt})`;
+          return (
+            <div
+              key={c.key}
+              style={{ ...panel, background: c.bg, alignItems: "stretch" }}
+            >
+              <p
+                style={{
+                  margin: 0,
+                  color: "#333",
+                  fontWeight: 600,
+                  textAlign: "center",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "0.5rem",
+                  flexWrap: "wrap",
+                }}
+              >
+                <img
+                  src={c.img}
+                  alt=""
+                  style={{ height: "2rem", width: "auto", objectFit: "contain" }}
+                />
+                <span>
+                  {c.label}{" "}
+                  <span style={{ color: "#666", fontWeight: 400, fontSize: "0.9em" }}>
+                    ({subtitle})
+                  </span>
+                </span>
+              </p>
+              {(["K", "M"] as const).map((sex) => {
+                const list = h[sex];
+                const sexLabel = sex === "K" ? "Female" : "Male";
+                return (
+                  <div
+                    key={sex}
+                    style={{
+                      borderTop: "1px solid rgba(0,0,0,0.08)",
+                      paddingTop: "0.25rem",
+                      marginTop: "0.25rem",
+                    }}
+                  >
+                    <div
+                      style={{
+                        color: "#555",
+                        fontWeight: 600,
+                        fontSize: "0.8rem",
+                        marginBottom: "0.15rem",
+                      }}
+                    >
+                      {sexLabel}
+                    </div>
+                    {[0, 1, 2].map((i) => {
+                      const holder = list[i];
+                      return (
+                        <div
+                          key={i}
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "baseline",
+                            gap: "0.5rem",
+                            padding: "0.1rem 0",
+                          }}
+                        >
+                          <span
+                            style={{
+                              color: "#777",
+                              fontWeight: 600,
+                              fontSize: "0.85rem",
+                              minWidth: "1rem",
+                            }}
+                          >
+                            {i + 1}.
+                          </span>
+                          <span
+                            style={{
+                              flex: "1 1 auto",
+                              textAlign: "left",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              fontSize: "0.9rem",
+                            }}
+                          >
+                            {holder?.name ?? "—"}
+                          </span>
+                          <span
+                            style={{
+                              fontVariantNumeric: "tabular-nums",
+                              fontWeight: 600,
+                              fontSize: "0.9rem",
+                            }}
+                          >
+                            {holder?.value ?? "—"}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+              <p
+                style={{
+                  margin: 0,
+                  color: "#777",
+                  fontSize: "0.75rem",
+                  textAlign: "right",
+                }}
+              >
+                {c.valueHeader}
+              </p>
+            </div>
+          );
+        })}
+      </>
     );
   }
 
@@ -421,8 +671,8 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
                 label="Current loop"
                 value={beforeStart ? "—" : String(backyardCompleted + 1)}
               bg="#facc15" valueColor="black" labelColor="black" />
-              <StatCard label="Loop time-limit (min)" value="60" valueColor="black" labelColor="black" />
-              <StatCard label="Next loop time-limit (min)" value="60" valueColor="black" labelColor="black" />
+              <StatCard label="Loop time-limit (min)" value="60" bg="#dc2626" valueColor="white" labelColor="white" />
+              <StatCard label="Next loop time-limit (min)" value="60" bg="#be0cfe" valueColor="white" labelColor="white" />
               <div style={{ flexBasis: "100%", height: 0 }} />
               <StatCard
                 label="Distance completed"
@@ -435,7 +685,7 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
                     label="Speed min:sek per km"
                     value={`${r.pace}`}
                     sub={`(${r.kmh} km/t)`}
-                  valueColor="black" labelColor="black" />
+                  bg="#111111" valueColor="white" labelColor="white" />
                 );
               })()}
               <StatCard
@@ -465,6 +715,8 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
                 gap: "0.75rem",
               }}
             >
+              <JerseyHoldersRow />
+              <div style={{ flexBasis: "100%", height: 0 }} />
               {beforeStart ? (
                 <>
                   <StatCard
@@ -475,19 +727,19 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
                   <StatCard
                     label="Loop time-limit (min)"
                     value={String(FRONTYARD_START_MIN)}
-                  valueColor="black" labelColor="black" />
+                  bg="#dc2626" valueColor="white" labelColor="white" />
                   {(() => {
                     const next = nextFrontyardLoopMin(1);
                     return (
                       <StatCard
                         label="Next loop time-limit (min)"
                         value={next === null ? "—" : String(next)}
-                      valueColor="black" labelColor="black" />
+                      bg="#be0cfe" valueColor="white" labelColor="white" />
                     );
                   })()}
                   <div style={{ flexBasis: "100%", height: 0 }} />
                   <StatCard
-                    label="Distance completed"
+                    label="Distance (km) completed"
                     value={formatKm(0)}
                   valueColor="black" labelColor="black" />
                   {(() => {
@@ -497,7 +749,7 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
                         label="Speed min:sek per km"
                         value={`${r.pace}`}
                         sub={`(${r.kmh} km/t)`}
-                      valueColor="black" labelColor="black" />
+                      bg="#111111" valueColor="white" labelColor="white" />
                     );
                   })()}
                   <StatCard
@@ -516,18 +768,18 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
                     value={String(frontyardCompleted)}
                   bg="#117a3a" valueColor="white" labelColor="white" />
                   <StatCard label="Current loop" value="—" bg="#facc15" valueColor="black" labelColor="black" />
-                  <StatCard label="Loop time-limit (min)" value="—" valueColor="black" labelColor="black" />
-                  <StatCard label="Next loop time-limit (min)" value="—" valueColor="black" labelColor="black" />
+                  <StatCard label="Loop time-limit (min)" value="—" bg="#dc2626" valueColor="white" labelColor="white" />
+                  <StatCard label="Next loop time-limit (min)" value="—" bg="#be0cfe" valueColor="white" labelColor="white" />
                   <div style={{ flexBasis: "100%", height: 0 }} />
                   <StatCard
-                    label="Distance completed"
+                    label="Distance (km) completed"
                     value={formatKm(frontyardDistance)}
                   valueColor="black" labelColor="black" />
                   <StatCard
                     label="Speed min:sek per km"
                     value="—"
                     sub="(—)"
-                  valueColor="black" labelColor="black" />
+                  bg="#111111" valueColor="white" labelColor="white" />
                   <StatCard
                     label="Race finished"
                     value="00:00"
@@ -551,14 +803,14 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
                   <StatCard
                     label="Loop time-limit (min)"
                     value={String(fy.loopLengthMin)}
-                  valueColor="black" labelColor="black" />
+                  bg="#dc2626" valueColor="white" labelColor="white" />
                   {(() => {
                     const next = nextFrontyardLoopMin(fy.loopNumber);
                     return (
                       <StatCard
                         label="Next loop time-limit (min)"
                         value={next === null ? "—" : String(next)}
-                      valueColor="black" labelColor="black" />
+                      bg="#be0cfe" valueColor="white" labelColor="white" />
                     );
                   })()}
                   <div style={{ flexBasis: "100%", height: 0 }} />
@@ -573,7 +825,7 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
                         label="Speed min:sek per km"
                         value={`${r.pace}`}
                         sub={`(${r.kmh} km/t)`}
-                      valueColor="black" labelColor="black" />
+                      bg="#111111" valueColor="white" labelColor="white" />
                     );
                   })()}
                   <StatCard
