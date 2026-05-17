@@ -3,6 +3,7 @@ import { ParticipantsDashboard } from "./ParticipantsDashboard";
 import { LeaderboardDashboard } from "./LeaderboardDashboard";
 import { TimerDashboard } from "./TimerDashboard";
 import { TimerSetupDashboard } from "./TimerSetupDashboard";
+import { JerseysDashboard } from "./JerseysDashboard";
 
 export type DashboardProps = { eventId: string; eventName?: string; eventLocation?: string };
 
@@ -32,5 +33,10 @@ export const dashboards: Dashboard[] = [
     id: "timer",
     title: "Dashboard",
     component: TimerDashboard,
+  },
+  {
+    id: "jerseys",
+    title: "Jerseys",
+    component: JerseysDashboard,
   },
 ];

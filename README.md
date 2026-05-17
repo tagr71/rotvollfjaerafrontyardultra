@@ -9,10 +9,19 @@ shows it in pickable dashboards.
 
 ## Dashboards
 
-The dashboard dropdown lists, in order: **Timer set-up**,
-**Number of participants**, **Leaderboard**, **Race dashboard**.
+The dashboard dropdown lists, in order: **Settings** (Timer set-up),
+**Overview** (number of participants), **Leaderboard**,
+**Dashboard** (race timer), **Jerseys**.
 
-- **Number of participants** — live participant count with auto-refresh.
+- **Overview** — live participant counters with auto-refresh, color
+  coded for at-a-glance reading. Top row: *Registered participants*
+  (neutral), *Starting runners* (yellow), *Starting Females (K)*
+  (red) and *Starting Males (M)* (blue). Middle row mirrors the
+  three coloured cells for runners *still in competition* per
+  gender. The bottom row shows *Acc. distance (km)* (green) summed
+  across every completed loop. When the race is finished the same
+  `⏮ ◀ Loop N / max ▶ ⏭ Live` playback bar appears and the still-in
+  counters / acc. distance follow the selected loop.
 - **Leaderboard** — sortable table polled every 30 s. Columns:
   Total Rank, Bib, Full Name, Club, Country (flag), Gender, Laps,
   Gap, Last (lap), Fastest, Slowest, Average, Total Time,
@@ -24,7 +33,7 @@ The dashboard dropdown lists, in order: **Timer set-up**,
   below N − 1 are hidden, and remaining rows have their laps/distance
   clamped to N. The selected loop is shared (via `localStorage`) with
   the Race dashboard, so both views stay in sync.
-- **Timer set-up** — configure the race start time, mode and per-event
+- **Settings (Timer set-up)** — configure the race start time, mode and per-event
   options (see below). All settings are stored in `localStorage`, keyed
   by event ID, and picked up live by the Race dashboard (same browser,
   via the `storage` event and a 2 s poll fallback). For a *finished*
@@ -33,11 +42,22 @@ The dashboard dropdown lists, in order: **Timer set-up**,
   the landing page's schema.org JSON-LD `startDate` (time of day
   defaults to 09:00), and the mode is inferred from the event name
   (`frontyard` / `backyard` substring).
-- **Race dashboard** — live race clock and per-loop stats. The main
+- **Dashboard (race timer)** — live race clock and per-loop stats. The main
   clock shows the elapsed (or remaining) time as `dd.hh.mm.ss` and
   ticks every wall-clock second (self-correcting `setTimeout` aligned
   to the second boundary, so `:00` rollovers stay in lockstep with the
-  system clock). Each section also surfaces two per-loop counters:
+  system clock). Stat cards are colour-coded: *Loops completed*
+  (green), *Current loop* (yellow), *Loop time-limit* (red), *Next
+  loop time-limit* (purple), *Speed min:sek per km* (black). In
+  Frontyard mode the top of the view also shows three **jersey holder**
+  cards — one per colour, with the matching jersey image, top 3
+  Women + top 3 Men after the last completed loop (name and total
+  points / overall time). The standings are driven by the live race
+  clock (`Loops completed`), so the cards advance the moment the
+  timer ticks past a loop boundary — independent of `/api/jerseys`
+  poll freshness. The card heading reads `(after X of Y loops)`
+  where Y is the configured end-loop for that jersey.
+  Each section also surfaces two per-loop counters:
   - *Runners completed past loop* — cumulative count of runners who
     finished loop N−1.
   - *Runners starting this loop* — subset of the above who actually
@@ -83,6 +103,37 @@ Configured in the **Timer set-up** dashboard, persisted per event ID:
   three beeps at 3 min remaining, two at 2 min, one at 1 min, and a
   bell at every loop rollover (and on race finish in Frontyard).
 
+### Jerseys
+
+- **Jerseys** — points-and-time standings for the three frontyard
+  jerseys: **Pink** (sprint points awarded at intermediate splits),
+  **Green** (sprint points awarded at the end of each loop), and
+  **Yellow** (fastest accumulated race time). The dashboard shows a
+  6-table overview (Women on top, Men below, top 10 each) with a
+  matching set of columns whose widths line up across the gender
+  pair. The current holder of each jersey gets a small **P** / **G** /
+  **Y** badge next to their name.
+
+  A **View** dropdown switches between *Overview* and the three detail
+  views. Each detail view shows one jersey for both genders with a
+  per-loop breakdown: points per loop for Pink/Green, and lap time +
+  cumulative race time per loop for Yellow. Each table heading is
+  annotated with `(ends at loop N)` so spectators can see when the
+  competition closes.
+
+  In live mode the standings advance loop-by-loop driven by the
+  race clock: the snapshot loop is the timer's `Loops completed`,
+  so the tables flip to the new loop the moment the timer crosses a
+  boundary. `/api/jerseys` is polled 5 seconds after every loop
+  boundary (with a 30 s fallback cadence) so the underlying data
+  catches up just after the snapshot advances.
+
+  Tie-breaking on equal-points jerseys uses the most recent
+  contributing loop (Pink/Green); Yellow ties break on the fastest
+  last completed loop. The shared **Race finished** replay control bar
+  (`localStorage`) lets you scrub through historical loops in lockstep
+  with the Race dashboard and Leaderboard.
+
 The front page lets you type a RaceResult event ID, pick a dashboard
 from a dropdown, and open it. A **← Back** button returns to the front
 page. The chosen event ID and dashboard are remembered in
@@ -126,6 +177,15 @@ FastAPI backend on port 8000.
   Each row has: `place`, `bib`, `name`, `club`, `country`, `sex`,
   `totalRank`, `lapsCompleted`, `lastLap`, `fastestLap`, `slowestLap`,
   `averageLap`, `status`, `gap`, `lapsBehind`, `total`.
+- `GET /api/jerseys?event_id=<id>` →
+  `{ "eventName": <str>, "eventId": <str>, "raceFinished": <bool>,
+     "green": [...], "pink": [...], "yellow": [...] }`.
+  Green/Pink entries: `{ bib, name, club, country, sex, points,
+  perLoop: [{ loop, points }] }`. Yellow entries:
+  `{ bib, name, club, country, sex, total, totalSec, lapsCompleted?,
+  perLoop?: [{ loop, time, lapSec, totalSec }] }`. Per-lap times are
+  pulled from the public RRPublish *Details* list when available.
+- `GET /api/health` → `{ "status": "ok" }`.
 
   `raceFinished` is `true` when at least `len(rows) − 1` rows have a
   status matching `dnf|dns|dq|withdrawn` (i.e. a single survivor).

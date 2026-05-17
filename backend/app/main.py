@@ -51,6 +51,7 @@ async def _fetch_list(
     page: str,
     *,
     listname_match: str | None = None,
+    listname_contains: str | None = None,
     contest: str = "0",
 ) -> tuple[dict[str, Any], str, str, str, str]:
     """Fetch a published RaceResult list. Returns
@@ -58,7 +59,9 @@ async def _fetch_list(
 
     The list is selected from the page's TabConfig.Lists. If `listname_match`
     is given, the first list whose name ends with `|{listname_match}` (or
-    matches exactly) is used; otherwise the first available list is used.
+    matches exactly) is used. If `listname_contains` is given instead, the
+    first list whose name contains that substring (case-insensitive) is
+    used. Otherwise the first available list is used.
     """
     _validate_event_id(event_id)
     config_url = f"{RACERESULT_BASE}/{event_id}/{page}/config?lang=en"
@@ -160,6 +163,13 @@ async def _fetch_list(
                 if name == listname_match or name.endswith(f"|{listname_match}"):
                     selected = lst
                     break
+        if selected is None and listname_contains:
+            needle = listname_contains.lower()
+            for lst in lists:
+                name = lst.get("Name", "")
+                if needle in name.lower():
+                    selected = lst
+                    break
         if selected is None:
             selected = lists[0]
 
@@ -190,6 +200,57 @@ async def _fetch_list(
             ) from exc
 
     return payload, event_name, event_location, event_date, event_time
+
+
+async def _fetch_details_list(
+    event_id: str, page: str, contest: str = "0"
+) -> dict[str, Any] | None:
+    """Fetch the per-lap "Details" list for `event_id` from the public
+    RRPublish endpoint. Returns the raw payload or None if not available.
+
+    RaceResult exposes per-lap times via a hidden Details list that the
+    authenticated `my.raceresult.com/{event}/results/...` API doesn't
+    serve — there the visible lists only reference it by a placeholder
+    name (``details0``). The same list is, however, served by the public
+    ``my2.raceresult.com/{event}/RRPublish/data/list`` endpoint under the
+    real listname found via that endpoint's config (e.g.
+    ``"02 - Result Lists|6 - Details"``).
+    """
+    _validate_event_id(event_id)
+    base = "https://my2.raceresult.com"
+    config_url = f"{base}/{event_id}/RRPublish/data/config"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(config_url)
+            resp.raise_for_status()
+            config = resp.json()
+        except httpx.HTTPError:
+            return None
+        key = config.get("key")
+        lists = config.get("lists") or []
+        details_name = ""
+        for lst in lists:
+            ref = lst.get("Details") if isinstance(lst, dict) else None
+            if isinstance(ref, str) and ref.strip() and ref.strip() != "details0":
+                details_name = ref.strip()
+                break
+        if not key or not details_name:
+            return None
+        try:
+            resp = await client.get(
+                f"{base}/{event_id}/RRPublish/data/list",
+                params={
+                    "key": key,
+                    "listname": details_name,
+                    "page": page,
+                    "contest": contest,
+                    "r": "all",
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()  # type: ignore[no-any-return]
+        except httpx.HTTPError:
+            return None
 
 
 def _count_rows(payload: Any) -> int:
@@ -619,98 +680,356 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/api/results/fields")
-async def results_fields(
-    event_id: str | None = None,
-    listname: str | None = None,
-) -> dict[str, object]:
-    """Debug: returns DataFields + the first row of the LIVE (or named) result
-    list so we can see exactly which RaceResult column names this event uses."""
-    resolved = event_id or RACERESULT_EVENT_ID
-    payload, event_name, _, _, _ = await _fetch_list(
-        resolved, "results", listname_match=listname or "LIVE"
+_GREEN_LOOP_RE = re.compile(r"^PoengRunde\s*0*(\d+)$", re.IGNORECASE)
+_PINK_LOOP_RE = re.compile(r"^MellomtidPoengRunde\s*0*(\d+)$", re.IGNORECASE)
+
+
+def _identity_indices(fields: list[Any]) -> dict[str, int]:
+    """Locate identity column indices (bib/name/sex/club/country)."""
+
+    def find_index(*candidates: str) -> int:
+        for c in candidates:
+            for i, f in enumerate(fields):
+                if f == c:
+                    return i
+        return -1
+
+    name_i = find_index(
+        "DisplayNameBib",
+        "DisplayNameOrTeam",
+        "DisplayName",
+        "FullName",
+        "Name",
     )
-    fields = payload.get("DataFields") or []
-    sample: Any = None
-    data = payload.get("data")
-    if isinstance(data, list) and data:
-        sample = data[0]
-    elif isinstance(data, dict):
-        for value in data.values():
-            if isinstance(value, list) and value:
-                sample = value[0]
+    if name_i == -1:
+        for i, f in enumerate(fields):
+            if isinstance(f, str) and ("[DisplayName]" in f or "[FullName]" in f):
+                name_i = i
                 break
     return {
-        "eventName": event_name,
-        "eventId": resolved,
-        "fields": fields,
-        "sampleRow": sample,
+        "bib": find_index("BIB"),
+        "name": name_i,
+        "sex": find_index("MaleFemale", "GenderMF", "SexMF", "SEX", "Sex"),
+        "club": find_index("ClubOrCity", "DisplayClubOrNames", "Club", "City"),
+        "country": find_index(
+            "NATION.FLAG", "NationOrStateFlag", "NationOrState", "Nation", "Country"
+        ),
     }
 
 
-@app.get("/api/results/lists")
-async def results_lists(
-    event_id: str | None = None,
-    page: str = "results",
-) -> dict[str, object]:
-    """Debug: enumerate every list published on `page` (default "results")
-    along with each list's DataFields and a sample row, so we can find one
-    that exposes the lap/round count we need."""
+def _iter_data_rows(payload: dict[str, Any]) -> list[list[Any]]:
+    """Flatten the `data` block of a RaceResult list payload into rows."""
+    out: list[list[Any]] = []
+    data = payload.get("data")
+    if isinstance(data, list):
+        for r in data:
+            if isinstance(r, list):
+                out.append(r)
+    elif isinstance(data, dict):
+        for value in data.values():
+            if isinstance(value, list):
+                for r in value:
+                    if isinstance(r, list):
+                        out.append(r)
+    return out
+
+
+def _identity_from(raw: list[Any], idx: dict[str, int]) -> dict[str, str]:
+    def cell(i: int) -> str:
+        return str(raw[i]) if 0 <= i < len(raw) else ""
+
+    sex_raw = cell(idx["sex"]).strip()
+    return {
+        "bib": cell(idx["bib"]),
+        "name": _NAME_BIB_RE.sub("", cell(idx["name"])).strip(),
+        "club": cell(idx["club"]),
+        "country": _extract_country(cell(idx["country"])),
+        "sex": _SEX_MAP.get(sex_raw.lower(), sex_raw),
+    }
+
+
+def _safe_int(text: str) -> int:
+    """Parse an integer from a cell; empty/non-numeric → 0."""
+    t = text.strip()
+    if not t:
+        return 0
+    try:
+        return int(float(t))
+    except ValueError:
+        return 0
+
+
+@app.get("/api/jerseys")
+async def jerseys(event_id: str | None = None) -> dict[str, object]:
+    """Return the per-jersey ranking tables for a frontyard event.
+
+    Reads the three RaceResult lists that publish jersey points directly:
+
+    * **Green** — `Grønn trøye …` list with `PoengRundeN` + `SumGrønnPoeng`.
+    * **Pink** — `Rosa trøye …` list with `MellomtidPoengRundeN` +
+      `SumRosaPoeng`.
+    * **Yellow** — `Gul trøye (totaltid)` list (or any list with a `Total`
+      time column; falls back to the default results list).
+
+    The response shape is:
+    `{ eventName, green: [...], pink: [...], yellow: [...] }`. Each entry
+    carries `{bib, name, club, country, sex, points|totalSec, perLoop?}`.
+    """
     resolved = event_id or RACERESULT_EVENT_ID
     _validate_event_id(resolved)
-    config_url = f"{RACERESULT_BASE}/{resolved}/{page}/config?lang=en"
 
-    async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
-        resp = await client.get(config_url)
-        resp.raise_for_status()
-        config = resp.json()
-        key = config.get("key")
-        server = (
-            config.get("server")
-            or RACERESULT_BASE.removeprefix("https://").removeprefix("http://")
-        )
-        lists = (config.get("TabConfig") or {}).get("Lists") or []
-        if not key:
-            raise HTTPException(status_code=502, detail="No key in config")
+    event_name = ""
 
-        list_url = f"https://{server}/{resolved}/{page}/list"
+    async def fetch_or_none(
+        substring: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        try:
+            payload, name, _, _, _ = await _fetch_list(
+                resolved, "results", listname_contains=substring
+            )
+            return payload, name
+        except HTTPException:
+            return None, ""
+
+    green_payload, green_event_name = await fetch_or_none("grønn")
+    pink_payload, pink_event_name = await fetch_or_none("rosa")
+    yellow_payload, yellow_event_name = await fetch_or_none("gul")
+    # Per-lap times for the yellow detail view come from the Details list,
+    # which expands `[Lap{n}]` into one row per (runner, lap) within a
+    # group keyed by bib/name. The Details list is referenced by the
+    # visible result lists via their `Details` field (it isn't itself
+    # exposed in TabConfig), so we fetch it directly by name.
+    details_payload = await _fetch_details_list(resolved, "results")
+    # The dedicated jersey lists omit sex/club/country/flag columns (only
+    # the green list still carries a sex column on some events, and even
+    # that is unreliable). Fetch the default LIVE list to populate those
+    # fields and to provide a yellow fallback when the dedicated yellow
+    # list is empty.
+    try:
+        live_payload, live_name, _, _, _ = await _fetch_list(resolved, "results")
+    except HTTPException:
+        live_payload, live_name = None, ""
+    event_name = (
+        green_event_name
+        or pink_event_name
+        or yellow_event_name
+        or live_name
+        or ""
+    )
+
+    # Build BIB -> identity lookup from the LIVE list so we can backfill
+    # sex/club/country on the jersey rows that lack those columns.
+    live_lookup: dict[str, dict[str, str]] = {}
+    if live_payload is not None:
+        live_fields = live_payload.get("DataFields") or []
+        live_idx = _identity_indices(live_fields)
+        for raw in _iter_data_rows(live_payload):
+            ident = _identity_from(raw, live_idx)
+            if ident["bib"]:
+                live_lookup[ident["bib"]] = ident
+
+    def backfill(entries: list[dict[str, Any]]) -> None:
+        for e in entries:
+            ref = live_lookup.get(str(e.get("bib", "")))
+            if not ref:
+                continue
+            for k in ("sex", "club", "country", "name"):
+                if not e.get(k):
+                    e[k] = ref.get(k, "")
+
+    def parse_points_list(
+        payload: dict[str, Any] | None,
+        loop_re: re.Pattern[str],
+        sum_field: str,
+    ) -> list[dict[str, Any]]:
+        if payload is None:
+            return []
+        fields = payload.get("DataFields") or []
+        idx = _identity_indices(fields)
+        loop_cols: list[tuple[int, int]] = []  # (loop, field_index)
+        sum_i = -1
+        for i, f in enumerate(fields):
+            if not isinstance(f, str):
+                continue
+            m = loop_re.match(f.strip())
+            if m:
+                loop_cols.append((int(m.group(1)), i))
+            elif f.strip().lower() == sum_field.lower():
+                sum_i = i
+        loop_cols.sort()
         out: list[dict[str, Any]] = []
-        for lst in lists:
-            name = lst.get("Name", "")
-            contest = str(lst.get("Contest") or "0")
-            params = {
-                "key": key,
-                "listname": name,
-                "page": page,
-                "contest": contest,
-                "r": "all",
-            }
-            try:
-                lr = await client.get(list_url, params=params)
-                lr.raise_for_status()
-                lp = lr.json()
-                fields = lp.get("DataFields") or []
-                sample: Any = None
-                data = lp.get("data")
-                if isinstance(data, list) and data:
-                    sample = data[0]
-                elif isinstance(data, dict):
-                    for value in data.values():
-                        if isinstance(value, list) and value:
-                            sample = value[0]
-                            break
-                out.append(
+
+        def cell(raw: list[Any], i: int) -> str:
+            return str(raw[i]) if 0 <= i < len(raw) else ""
+
+        for raw in _iter_data_rows(payload):
+            identity = _identity_from(raw, idx)
+            per_loop = [
+                {"loop": n, "points": _safe_int(cell(raw, i))}
+                for n, i in loop_cols
+            ]
+            total = _safe_int(cell(raw, sum_i)) if sum_i >= 0 else sum(
+                p["points"] for p in per_loop
+            )
+            entry: dict[str, Any] = dict(identity)
+            entry["points"] = total
+            entry["perLoop"] = per_loop
+            out.append(entry)
+        out.sort(key=lambda r: (-int(r["points"]), str(r["bib"])))
+        return out
+
+    green = parse_points_list(green_payload, _GREEN_LOOP_RE, "SumGrønnPoeng")
+    pink = parse_points_list(pink_payload, _PINK_LOOP_RE, "SumRosaPoeng")
+
+    def parse_yellow(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if payload is None:
+            return []
+        fields = payload.get("DataFields") or []
+        idx = _identity_indices(fields)
+        total_i = -1
+        laps_i = -1
+        for i, f in enumerate(fields):
+            if isinstance(f, str):
+                s = f.strip()
+                if s.lower() in ("total", "totaltime"):
+                    total_i = i
+                elif s.lower() in ("numberoflaps", "lapcount", "laps"):
+                    laps_i = i
+        out: list[dict[str, Any]] = []
+
+        def cell(raw: list[Any], i: int) -> str:
+            return str(raw[i]) if 0 <= i < len(raw) else ""
+
+        for raw in _iter_data_rows(payload):
+            identity = _identity_from(raw, idx)
+            total_text = cell(raw, total_i) if total_i >= 0 else ""
+            total_sec = _parse_hms(total_text)
+            entry: dict[str, Any] = dict(identity)
+            entry["total"] = total_text
+            entry["totalSec"] = total_sec if total_sec is not None else 0
+            if laps_i >= 0:
+                entry["lapsCompleted"] = _safe_int(cell(raw, laps_i))
+            out.append(entry)
+        # Ascending total time (fastest first); zero/missing sort last.
+        out.sort(key=lambda r: (int(r["totalSec"]) or 10**12, str(r["bib"])))
+        return out
+
+    yellow = parse_yellow(yellow_payload)
+    # Fallback: derive yellow from the LIVE list when the dedicated yellow
+    # list is empty (some events only populate it after the race ends).
+    if not yellow and live_payload is not None:
+        yellow = parse_yellow(live_payload)
+
+    # Per-lap split times keyed by bib, parsed from the Details list.
+    # Each entry is `{loop, time, totalSec}` where `time` is the elapsed
+    # lap time (e.g. "47:30") and `totalSec` is the cumulative race time
+    # at the end of that lap, in seconds. Used by the Yellow detail view.
+    def parse_lap_times(
+        payload: dict[str, Any] | None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        if payload is None:
+            return {}
+        fields = payload.get("DataFields") or []
+        bib_i = -1
+        lap_i = -1
+        total_i = -1
+        # The Details list uses formula expressions like `[Lap{n}]` and
+        # `[Total{n}]` where `{n}` is the lap index. We identify the
+        # columns by substring match against those tokens.
+        for i, f in enumerate(fields):
+            if not isinstance(f, str):
+                continue
+            s = f.strip()
+            if s == "BIB":
+                bib_i = i
+            elif s == "[Lap{n}]":
+                lap_i = i
+            elif s == "[Total{n}]":
+                total_i = i
+        if bib_i < 0 or lap_i < 0:
+            return {}
+        out: dict[str, list[dict[str, Any]]] = {}
+        data = payload.get("data")
+        # Data is a dict of group -> list-of-rows; each row is one lap.
+        groups: list[list[Any]] = []
+        if isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, list):
+                    groups.append(v)
+        elif isinstance(data, list):
+            groups.append(data)
+        for rows in groups:
+            for raw in rows:
+                if not isinstance(raw, list):
+                    continue
+                bib = str(raw[bib_i]).strip() if bib_i < len(raw) else ""
+                if not bib:
+                    continue
+                lap_time = str(raw[lap_i]).strip() if lap_i < len(raw) else ""
+                if not lap_time:
+                    continue
+                lst = out.setdefault(bib, [])
+                loop_n = len(lst) + 1
+                total_text = (
+                    str(raw[total_i]).strip()
+                    if 0 <= total_i < len(raw)
+                    else ""
+                )
+                total_sec = _parse_hms(total_text) or 0
+                lap_sec = _parse_hms(lap_time)
+                lst.append(
                     {
-                        "name": name,
-                        "contest": contest,
-                        "fields": fields,
-                        "sampleRow": sample,
+                        "loop": loop_n,
+                        "time": lap_time,
+                        "lapSec": lap_sec if lap_sec is not None else 0,
+                        "totalSec": total_sec,
                     }
                 )
-            except httpx.HTTPError as exc:
-                out.append({"name": name, "contest": contest, "error": str(exc)})
+        return out
 
-    return {"eventId": resolved, "page": page, "lists": out}
+    lap_times_by_bib = parse_lap_times(details_payload)
+    if lap_times_by_bib:
+        for e in yellow:
+            laps = lap_times_by_bib.get(str(e.get("bib", "")))
+            if laps:
+                e["perLoop"] = laps
+
+    for entries in (green, pink, yellow):
+        backfill(entries)
+
+    # Compute raceFinished using the same heuristic as /api/results: all
+    # but at most one runner is marked DNF/DNS/DQ in the LIVE list. Also
+    # backfill lapsCompleted on yellow entries (the LIVE list itself has
+    # no NumberOfLaps column, but _flatten_results derives it).
+    race_finished = False
+    if live_payload is not None:
+        live_rows = _flatten_results(live_payload)
+        laps_lookup: dict[str, int] = {}
+        for r in live_rows:
+            bib = str(r.get("bib") or "")
+            lc = r.get("lapsCompleted")
+            if bib and isinstance(lc, int):
+                laps_lookup[bib] = lc
+        for e in yellow:
+            if "lapsCompleted" not in e:
+                lc = laps_lookup.get(str(e.get("bib", "")))
+                if lc is not None:
+                    e["lapsCompleted"] = lc
+        if len(live_rows) >= 2:
+            out_pattern = re.compile(r"dnf|dns|dq|withdrawn", re.IGNORECASE)
+            out_count = sum(
+                1 for r in live_rows if out_pattern.search(str(r.get("status") or ""))
+            )
+            race_finished = out_count >= len(live_rows) - 1
+
+    return {
+        "eventName": event_name,
+        "eventId": resolved,
+        "raceFinished": race_finished,
+        "green": green,
+        "pink": pink,
+        "yellow": yellow,
+    }
 
 
 @app.get("/", include_in_schema=False)

@@ -6,7 +6,7 @@ import {
   useViewLoop,
 } from "./timerCore";
 
-type CountResponse = { count: number; eventName?: string; eventId?: string };
+type CountResponse = { count: number; eventName?: string };
 type ResultRow = {
   sex?: string;
   status?: string;
@@ -46,19 +46,19 @@ export function ParticipantsDashboard({ eventId }: { eventId: string }) {
         if (!countRes.ok) {
           throw new Error(`HTTP ${countRes.status}: ${await countRes.text()}`);
         }
-        const data: CountResponse = await countRes.json();
-        const results: ResultsResponse = resultsRes.ok
+        const countData: CountResponse = await countRes.json();
+        const resultsData: ResultsResponse = resultsRes.ok
           ? await resultsRes.json()
           : {};
         if (cancelled || idRef.current !== id) return;
-        setCount(data.count);
-        setRows(results.rows ?? []);
-        setEventName(data.eventName ?? "");
-        setRaceFinished(Boolean(results.raceFinished));
+        setCount(countData.count);
+        setRows(resultsData.rows ?? []);
+        setEventName(countData.eventName ?? "");
+        setRaceFinished(Boolean(resultsData.raceFinished));
         setError(null);
         setLastUpdated(new Date());
         // No point polling once the race is over — the data is static.
-        if (results.raceFinished && timer !== null) {
+        if (resultsData.raceFinished && timer !== null) {
           window.clearInterval(timer);
           timer = null;
         }
@@ -85,11 +85,13 @@ export function ParticipantsDashboard({ eventId }: { eventId: string }) {
 
   const loopKm = mode === "frontyard" ? FRONTYARD_LOOP_KM : BACKYARD_LOOP_KM;
   const maxLoop = useMemo(() => {
-    let m = 0;
+    let max = 0;
     for (const r of rows) {
-      if (typeof r.lapsCompleted === "number" && r.lapsCompleted > m) m = r.lapsCompleted;
+      if (typeof r.lapsCompleted === "number" && r.lapsCompleted > max) {
+        max = r.lapsCompleted;
+      }
     }
-    return m;
+    return max;
   }, [rows]);
   const effectiveViewLoop =
     raceFinished && viewLoop !== null && maxLoop >= 1
@@ -235,27 +237,18 @@ export function ParticipantsDashboard({ eventId }: { eventId: string }) {
       {count !== null && (
         <>
           <div style={registeredRow}>
-            <div style={registeredCell}>
-              <div style={statLabel}>Registered participants</div>
-              <p style={bigNumber}>{count}</p>
-            </div>
-            <div style={registeredCell}>
-              <div style={statLabel}>Registered Female (K)</div>
-              <p style={bigNumber}>{fmt(female)}</p>
-            </div>
-            <div style={registeredCell}>
-              <div style={statLabel}>Registered Men (M)</div>
-              <p style={bigNumber}>{fmt(male)}</p>
-            </div>
+            <RegisteredCell label="Registered participants" value={count} />
+            <RegisteredCell label="Starting runners" value={fmt(starting)} bg="#facc15" color="black" />
+            <RegisteredCell label="Starting Females (K)" value={fmt(female)} bg="#dc2626" color="white" />
+            <RegisteredCell label="Starting Males (M)" value={fmt(male)} bg="#2563eb" color="white" />
           </div>
           <div style={statGridFour}>
-            <StatCard label="Starting runners" value={fmt(starting)} />
-            <StatCard label="Still in competition" value={fmt(stillIn)} />
-            <StatCard label="Female still in" value={fmt(femaleStillIn)} />
-            <StatCard label="Men still in" value={fmt(maleStillIn)} />
+            <StatCard label="Still in competition" value={fmt(stillIn)} bg="#facc15" color="black" />
+            <StatCard label="Female still in" value={fmt(femaleStillIn)} bg="#dc2626" color="white" />
+            <StatCard label="Men still in" value={fmt(maleStillIn)} bg="#2563eb" color="white" />
           </div>
           <div style={statGridBottom}>
-            <StatCard label="Acc. distance (all)" value={fmtKm(accKm)} />
+            <StatCard label="Acc. distance (km)" value={fmtKm(accKm)} bg="#117a3a" color="white" />
           </div>
         </>
       )}
@@ -270,11 +263,52 @@ export function ParticipantsDashboard({ eventId }: { eventId: string }) {
   );
 }
 
-function StatCard({ label, value }: { label: string; value: string | number }) {
+function StatCard({
+  label,
+  value,
+  bg,
+  color,
+}: {
+  label: string;
+  value: string | number;
+  bg?: string;
+  color?: string;
+}) {
   return (
-    <div style={statCard}>
-      <div style={statCardLabel}>{label}</div>
-      <div style={statCardValue}>{value}</div>
+    <div style={{ ...statCard, ...(bg ? { background: bg } : {}) }}>
+      <div style={{ ...statCardLabel, ...(color ? { color } : {}) }}>{label}</div>
+      <div style={{ ...statCardValue, ...(color ? { color } : {}) }}>{value}</div>
+    </div>
+  );
+}
+
+function RegisteredCell({
+  label,
+  value,
+  bg,
+  color,
+}: {
+  label: string;
+  value: string | number;
+  bg?: string;
+  color?: string;
+}) {
+  const cellStyle: React.CSSProperties = {
+    ...registeredCell,
+    ...(bg ? { background: bg, padding: "0.75rem", borderRadius: "0.4rem" } : {}),
+  };
+  const labelStyle: React.CSSProperties = {
+    ...statLabel,
+    ...(color ? { color } : {}),
+  };
+  const valueStyle: React.CSSProperties = {
+    ...bigNumber,
+    ...(color ? { color } : {}),
+  };
+  return (
+    <div style={cellStyle}>
+      <div style={labelStyle}>{label}</div>
+      <p style={valueStyle}>{value}</p>
     </div>
   );
 }
@@ -293,7 +327,7 @@ const statLabel: React.CSSProperties = {
 
 const statGridFour: React.CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+  gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
   gap: "1rem",
   width: "100%",
   marginTop: "1rem",
@@ -301,7 +335,7 @@ const statGridFour: React.CSSProperties = {
 
 const registeredRow: React.CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+  gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
   gap: "1rem",
   width: "100%",
   alignItems: "end",
