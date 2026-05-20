@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   FRONTYARD_MAX_CAP,
+  formatHms,
   frontyardElapsedAtLoopStart,
   frontyardState,
   osloWallClockToInstant,
+  playbackBtn,
   useNowTick,
   useTimerSettings,
   useViewLoop,
@@ -30,16 +32,6 @@ type JerseysPayload = {
 
 type Sex = "M" | "K";
 
-function formatHms(sec: number): string {
-  const s = Math.max(0, Math.round(sec));
-  const h = Math.floor(s / 3600);
-  const rem = s % 3600;
-  const mm = Math.floor(rem / 60);
-  const ss = rem % 60;
-  const pad = (n: number) => n.toString().padStart(2, "0");
-  return h > 0 ? `${h}:${pad(mm)}:${pad(ss)}` : `${mm}:${pad(ss)}`;
-}
-
 /** Sum the runner's perLoop points up to (and including) `maxLoop`.
  * Falls back to the backend-reported total if no perLoop data exists. */
 function sumUpto(entry: JerseyEntry, maxLoop: number): number {
@@ -63,6 +55,26 @@ function pointsAtLoop(entry: JerseyEntry, loop: number): number {
 function lapSecAtLoop(entry: JerseyEntry, loop: number): number {
   const p = (entry.perLoop ?? []).find((x) => x.loop === loop);
   return p?.lapSec ?? 0;
+}
+
+/** Accumulated race time (seconds) from loop 1 through `maxLoop`. Prefers
+ * the per-loop cumulative `totalSec` at the cap; falls back to summing
+ * `lapSec` values; and finally to the entry-level `totalSec` when no
+ * per-loop data is available. */
+function accTimeUpto(entry: JerseyEntry, maxLoop: number): number {
+  const capped = (entry.perLoop ?? []).filter((p) => p.loop <= maxLoop);
+  if (capped.length > 0) {
+    const last = capped[capped.length - 1];
+    if (typeof last.totalSec === "number" && last.totalSec > 0) {
+      return last.totalSec;
+    }
+    const sum = capped.reduce(
+      (acc, p) => acc + (typeof p.lapSec === "number" ? p.lapSec : 0),
+      0,
+    );
+    if (sum > 0) return sum;
+  }
+  return entry.totalSec ?? 0;
 }
 
 /** Highest loop number with any recorded data on the runner. */
@@ -288,7 +300,7 @@ function rankByPoints(
   return out;
 }
 
-export function JerseysDashboard({ eventId, eventName }: { eventId: string; eventName?: string }) {
+export function Jerseys({ eventId, eventName }: { eventId: string; eventName?: string }) {
   const { mode, startTime, fyLock, fyMax, jerseyGreen, jerseyPink, jerseyYellow } =
     useTimerSettings(eventId);
   const { viewLoop, setViewLoop } = useViewLoop(eventId);
@@ -404,10 +416,6 @@ export function JerseysDashboard({ eventId, eventName }: { eventId: string; even
     return max;
   }, [data]);
   const raceFinished = Boolean(data?.raceFinished);
-  const effectiveViewLoop =
-    viewLoop !== null && maxLoop >= 1
-      ? Math.min(Math.max(1, viewLoop), maxLoop)
-      : null;
 
   // Live race-clock derived completed-loop count. In live mode this is
   // what drives the snapshot so the standings advance the moment the
@@ -421,6 +429,15 @@ export function JerseysDashboard({ eventId, eventName }: { eventId: string; even
     const maxLoops = Math.min(FRONTYARD_MAX_CAP, Math.max(1, fyMax));
     return frontyardState(elapsedSec, fyLock, maxLoops).loopsCompleted;
   }, [mode, raceStartMs, now, fyLock, fyMax]);
+
+  // Replay scrubber is available at all times on the Jerseys dashboard
+  // — it's useful even mid-race to inspect how the standings looked at
+  // an earlier loop. `effectiveViewLoop` is null when the user hasn't
+  // scrubbed (i.e. "Live").
+  const effectiveViewLoop =
+    viewLoop !== null && maxLoop >= 1
+      ? Math.min(Math.max(1, viewLoop), maxLoop)
+      : null;
 
   // In live mode the standings and detail views snap to the last
   // completed loop reported by the race clock, so they advance the
@@ -457,13 +474,11 @@ export function JerseysDashboard({ eventId, eventName }: { eventId: string; even
     snapshotLoop !== null ? Math.min(jerseyPink, snapshotLoop) : jerseyPink;
 
   // Yellow: ranked by accumulated total time (ascending — fastest first).
-  // Ties on total time are broken by the lap time on the runner's last
-  // completed loop (fastest wins). We filter to runners who had completed
-  // at least `snapshotLoop` loops — in live mode this means survivors of
-  // the most recently completed round; in replay it reproduces the
-  // standings at the scrubbed loop. The displayed Total time is still
-  // their full-race total (per-loop cumulative times aren't published by
-  // RaceResult).
+  // In replay mode, the total is the cumulative time from loop 1 through
+  // the selected loop (so the standings reproduce the snapshot at that
+  // moment); in live mode it's the runner's full-race total. Ties on the
+  // ranking time are broken by the lap time on the latest counted loop.
+  // We filter to runners who had completed at least `snapshotLoop` loops.
   const yellowBySex = useMemo(() => {
     const out: Record<Sex, DisplayRow[]> = { M: [], K: [] };
     for (const sex of ["K", "M"] as Sex[]) {
@@ -476,16 +491,21 @@ export function JerseysDashboard({ eventId, eventName }: { eventId: string; even
         }
         return true;
       });
+      const rankingTime = (e: JerseyEntry): number =>
+        effectiveViewLoop !== null
+          ? accTimeUpto(e, effectiveViewLoop)
+          : e.totalSec ?? 0;
       const sorted = [...filtered].sort((a, b) => {
-        const ta = a.totalSec ?? 0;
-        const tb = b.totalSec ?? 0;
+        const ta = rankingTime(a);
+        const tb = rankingTime(b);
         if (ta !== tb) return ta - tb;
-        // Tie: faster lap on the last common completed loop wins. We pick
-        // the larger of the two last-loop indices so we always compare on
-        // the most recent shared loop.
-        const lastA = lastCompletedLoop(a);
-        const lastB = lastCompletedLoop(b);
-        const tieLoop = Math.max(lastA, lastB, 1);
+        // Tie: faster lap on the last counted loop wins. In replay, that's
+        // the scrubbed loop; otherwise, the larger of the two last-loop
+        // indices so we always compare on the most recent shared loop.
+        const tieLoop =
+          effectiveViewLoop !== null
+            ? effectiveViewLoop
+            : Math.max(lastCompletedLoop(a), lastCompletedLoop(b), 1);
         return lapSecAtLoop(a, tieLoop) - lapSecAtLoop(b, tieLoop);
       });
       out[sex] = sorted.slice(0, 10).map((e, i) => ({
@@ -493,15 +513,19 @@ export function JerseysDashboard({ eventId, eventName }: { eventId: string; even
         bib: e.bib,
         name: e.name,
         club: e.club,
-        value: formatHms(e.totalSec ?? 0),
+        value: formatHms(rankingTime(e)),
         sub:
           typeof e.lapsCompleted === "number"
-            ? `(${e.lapsCompleted} loops)`
+            ? `(${
+                effectiveViewLoop !== null
+                  ? Math.min(e.lapsCompleted, effectiveViewLoop)
+                  : e.lapsCompleted
+              } loops)`
             : undefined,
       }));
     }
     return out;
-  }, [data, sexLookup, snapshotLoop]);
+  }, [data, sexLookup, snapshotLoop, effectiveViewLoop]);
 
   // Green: backend supplies per-loop points + total. Cap at greenCap.
   // Tie-break: most points on the snapshot loop.
@@ -741,9 +765,7 @@ export function JerseysDashboard({ eventId, eventName }: { eventId: string; even
                 endsAt={jerseyYellow}
                 note={
                   snapshotLoop !== null
-                    ? `≥ loop ${snapshotLoop} · ${
-                        effectiveViewLoop !== null ? "final total" : "running total"
-                      }`
+                    ? `loops 1–${snapshotLoop} · cumulative time`
                     : `finishes loop ${jerseyYellow}`
                 }
               />
@@ -755,9 +777,7 @@ export function JerseysDashboard({ eventId, eventName }: { eventId: string; even
                 endsAt={jerseyYellow}
                 note={
                   snapshotLoop !== null
-                    ? `≥ loop ${snapshotLoop} · ${
-                        effectiveViewLoop !== null ? "final total" : "running total"
-                      }`
+                    ? `loops 1–${snapshotLoop} · cumulative time`
                     : `finishes loop ${jerseyYellow}`
                 }
               />
@@ -1065,12 +1085,4 @@ const tdNum: React.CSSProperties = {
   ...td,
   textAlign: "right",
   fontVariantNumeric: "tabular-nums",
-};
-const playbackBtn: React.CSSProperties = {
-  padding: "0.3rem 0.6rem",
-  fontSize: "1rem",
-  border: "1px solid #ccc",
-  borderRadius: "0.3rem",
-  background: "white",
-  cursor: "pointer",
 };

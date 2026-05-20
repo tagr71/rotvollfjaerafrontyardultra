@@ -30,7 +30,7 @@ function isoToPicker(iso: string): string {
   return `${y}-${mo}-${d}T${h}:${mi}:${s ?? "00"}`;
 }
 
-export function TimerSetupDashboard({ eventId, eventName, eventLocation }: { eventId: string; eventName?: string; eventLocation?: string }) {
+export function Settings({ eventId, eventName, eventLocation }: { eventId: string; eventName?: string; eventLocation?: string }) {
   const now = useNowTick();
   const { startTime, setStartTime, mode, setMode, fyLock, setFyLock, fyMax, setFyMax,
     beepEnabled, setBeepEnabled, location, setLocation,

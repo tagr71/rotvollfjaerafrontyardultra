@@ -19,7 +19,7 @@ const DNS_PATTERN = /dns/i;
 
 const REFRESH_MS = 30_000;
 
-export function ParticipantsDashboard({ eventId }: { eventId: string }) {
+export function Overview({ eventId }: { eventId: string }) {
   const { mode } = useTimerSettings(eventId);
   const { viewLoop, setViewLoop } = useViewLoop(eventId);
   const [count, setCount] = useState<number | null>(null);
@@ -144,7 +144,7 @@ export function ParticipantsDashboard({ eventId }: { eventId: string }) {
   const hasResults = rows.length > 0;
   const fmt = (n: number) => (hasResults ? n.toString() : "—");
   const fmtKm = (n: number) =>
-    hasResults ? n.toFixed(n >= 100 ? 0 : 1) : "—";
+    hasResults ? n.toFixed(1) : "—";
 
   return (
     <section

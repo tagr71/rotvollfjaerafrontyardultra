@@ -16,12 +16,13 @@ import {
   panel,
   playBeep,
   playBell,
+  playbackBtn,
   useNowTick,
   useTimerSettings,
   useViewLoop,
 } from "./timerCore";
 
-export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId: string; eventName?: string; eventLocation?: string }) {
+export function Dashboard({ eventId, eventName, eventLocation }: { eventId: string; eventName?: string; eventLocation?: string }) {
   const now = useNowTick();
   const { startTime, mode, fyLock, fyMax, beepEnabled, location,
     jerseyPink, jerseyGreen, jerseyYellow } = useTimerSettings(eventId);
@@ -139,7 +140,20 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
   // `viewLoop` is null while live; a number 1..maxLoop while scrubbing.
   const { viewLoop, setViewLoop } = useViewLoop(eventId);
   const maxLoop = finalLaps.length ? Math.max(1, ...finalLaps) : 0;
-  const inReplay = viewLoop !== null && viewLoop >= 1 && maxLoop >= 1;
+
+  // "Live" vs "Archived" gating: the replay scrubber is only available
+  // once the race is actually over. For frontyard we use the local race
+  // clock (the backend's `raceFinished` heuristic flips true spuriously
+  // a few seconds into the race when only a placeholder leader is in
+  // the field). Backyard has no fixed end, so we fall back to the
+  // backend flag there.
+  const raceClockFinished =
+    mode === "frontyard"
+      ? startInstant !== null && frontyardState(liveElapsedSec, fyLock, fyMax).finished
+      : raceFinished;
+  const replayAvailable = raceClockFinished && maxLoop >= 1;
+  const inReplay =
+    replayAvailable && viewLoop !== null && viewLoop >= 1;
   const effectiveViewLoop = inReplay
     ? Math.min(Math.max(1, viewLoop as number), Math.max(1, maxLoop))
     : null;
@@ -181,8 +195,7 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
   const frontyardDistance = frontyardCompleted * FRONTYARD_LOOP_KM;
 
   /** Snapshot loop for the Dashboard's jersey holder cards. In live mode
-   * this followsgit status
-   *  race clock (so the cards advance as soon as the
+   * this follows the race clock (so the cards advance as soon as the
    * timer ticks over to a new loop); in replay it follows the scrubber.
    * `frontyardCompleted` already reflects both cases. */
   const holderSnapshotLoop = mode === "frontyard" ? frontyardCompleted : 0;
@@ -550,7 +563,7 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
 
       <NowOsloRow now={now} eventLocation={location || eventLocation} />
 
-      {maxLoop >= 1 && (
+      {replayAvailable && (
         <div
           style={{
             display: "flex",
@@ -563,7 +576,7 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
           }}
         >
           <span style={{ fontWeight: 600 }}>
-            {inReplay ? "Replay" : raceFinished ? "Race finished" : "Live"}
+            {inReplay ? "Replay" : "Race finished"}
           </span>
           <button
             type="button"
@@ -853,12 +866,3 @@ export function TimerDashboard({ eventId, eventName, eventLocation }: { eventId:
     </section>
   );
 }
-
-const playbackBtn: React.CSSProperties = {
-  padding: "0.3rem 0.6rem",
-  fontSize: "1rem",
-  border: "1px solid #ccc",
-  borderRadius: "0.3rem",
-  background: "white",
-  cursor: "pointer",
-};

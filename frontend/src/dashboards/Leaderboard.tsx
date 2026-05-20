@@ -1,5 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { BACKYARD_LOOP_KM, FRONTYARD_LOOP_KM, useTimerSettings, useViewLoop } from "./timerCore";
+import {
+  BACKYARD_LOOP_KM,
+  FRONTYARD_LOOP_KM,
+  FRONTYARD_MAX_CAP,
+  formatHms,
+  frontyardElapsedAtLoopStart,
+  osloWallClockToInstant,
+  playbackBtn,
+  useTimerSettings,
+  useViewLoop,
+} from "./timerCore";
 
 type ResultRow = {
   place: number | null;
@@ -18,10 +28,16 @@ type ResultRow = {
   gap: string;
   lapsBehind: number | null;
   total: string;
+  perLoop?: { loop: number; time: string; lapSec?: number; totalSec?: number }[];
 };
 type ResultsResponse = { eventName?: string; raceFinished?: boolean; rows: ResultRow[] };
 
-type DerivedRow = ResultRow & { laps: number | null; distanceKm: number | null };
+type DerivedRow = ResultRow & {
+  laps: number | null;
+  distanceKm: number | null;
+  accTime: string;
+  accTimeSec: number | null;
+};
 
 const REFRESH_MS = 30_000;
 
@@ -85,6 +101,7 @@ const columns: { key: SortKey; label: string; numeric?: boolean }[] = [
   { key: "slowestLap", label: "Slowest" },
   { key: "averageLap", label: "Average" },
   { key: "total", label: "Total Time" },
+  { key: "accTimeSec", label: "Acc. Time", numeric: true },
   { key: "distanceKm", label: "Acc. Distance" },
   { key: "status", label: "Status" },
 ];
@@ -111,8 +128,8 @@ function compare(a: DerivedRow, b: DerivedRow, key: SortKey, dir: SortDir): numb
   return dir === "asc" ? cmp : -cmp;
 }
 
-export function LeaderboardDashboard({ eventId }: { eventId: string }) {
-  const { mode } = useTimerSettings(eventId);
+export function Leaderboard({ eventId }: { eventId: string }) {
+  const { mode, startTime, fyLock, fyMax } = useTimerSettings(eventId);
   const { viewLoop, setViewLoop } = useViewLoop(eventId);
   const [rows, setRows] = useState<ResultRow[]>([]);
   const [raceFinished, setRaceFinished] = useState(false);
@@ -123,9 +140,47 @@ export function LeaderboardDashboard({ eventId }: { eventId: string }) {
   const [sortKey, setSortKey] = useState<SortKey>("totalRank");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
 
+  // Wall-clock instant for the configured frontyard start time (if any).
+  const raceStartMs = useMemo(() => {
+    if (mode !== "frontyard" || !startTime) return null;
+    const instant = osloWallClockToInstant(startTime);
+    return instant ? instant.getTime() : null;
+  }, [mode, startTime]);
+
   useEffect(() => {
     let cancelled = false;
     let timer: number | null = null;
+    /** Buffer after a loop boundary before refetching, giving
+     * RaceResult a few seconds to publish the just-completed loop. */
+    const POST_LOOP_DELAY_MS = 5_000;
+    /** Fallback cadence used when no loop boundary is scheduled
+     * (backyard mode, race not yet started, race already finished). */
+    const FALLBACK_MS = 30_000;
+
+    function nextLoopBoundaryAfter(nowMs: number): number | null {
+      if (raceStartMs === null) return null;
+      const maxLoops = Math.min(FRONTYARD_MAX_CAP, Math.max(1, fyMax));
+      for (let k = 1; k <= maxLoops; k += 1) {
+        const endSec = frontyardElapsedAtLoopStart(k + 1, fyLock);
+        const endMs = raceStartMs + endSec * 1000;
+        if (endMs > nowMs) return endMs;
+      }
+      return null;
+    }
+
+    function scheduleNext() {
+      if (cancelled) return;
+      const nowMs = Date.now();
+      const boundary = nextLoopBoundaryAfter(nowMs);
+      let delay: number;
+      if (boundary !== null) {
+        const untilBoundary = boundary + POST_LOOP_DELAY_MS - nowMs;
+        delay = Math.max(1_000, Math.min(FALLBACK_MS, untilBoundary));
+      } else {
+        delay = FALLBACK_MS;
+      }
+      timer = window.setTimeout(load, delay);
+    }
 
     async function load() {
       try {
@@ -142,15 +197,11 @@ export function LeaderboardDashboard({ eventId }: { eventId: string }) {
         setRaceFinished(Boolean(data.raceFinished));
         setError(null);
         setLastUpdated(new Date());
-        // No point polling a finished race — the data is static.
-        if (data.raceFinished && timer !== null) {
-          window.clearInterval(timer);
-          timer = null;
-        }
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
       } finally {
         if (!cancelled) setLoading(false);
+        scheduleNext();
       }
     }
 
@@ -158,12 +209,11 @@ export function LeaderboardDashboard({ eventId }: { eventId: string }) {
     setRows([]);
     setError(null);
     load();
-    timer = window.setInterval(load, REFRESH_MS);
     return () => {
       cancelled = true;
-      if (timer !== null) window.clearInterval(timer);
+      if (timer !== null) window.clearTimeout(timer);
     };
-  }, [eventId]);
+  }, [eventId, raceStartMs, fyLock, fyMax]);
 
   const maxLoop = useMemo(() => {
     let m = 0;
@@ -172,6 +222,7 @@ export function LeaderboardDashboard({ eventId }: { eventId: string }) {
     }
     return m;
   }, [rows]);
+
   const effectiveViewLoop =
     viewLoop !== null && maxLoop >= 1
       ? Math.min(Math.max(1, viewLoop), maxLoop)
@@ -210,10 +261,43 @@ export function LeaderboardDashboard({ eventId }: { eventId: string }) {
       if (effectiveViewLoop !== null && laps !== null) {
         laps = Math.min(laps, effectiveViewLoop);
       }
+      // When replaying, the "Last" column shows the lap time of the
+      // selected loop (the loop that was just completed at that point in
+      // the race) rather than the runner's most recent lap.
+      let lastLap = r.lastLap;
+      if (effectiveViewLoop !== null) {
+        const lap = r.perLoop?.find((p) => p.loop === effectiveViewLoop);
+        lastLap = lap?.time ?? "";
+      }
+      // "Acc. Time" is the cumulative race time from loop 1 to the
+      // viewed loop (in live mode: through the runner's last lap). We
+      // prefer the Details list's `totalSec` when present, and fall back
+      // to summing per-lap `lapSec` values up to the cap.
+      let accTimeSec: number | null = null;
+      if (r.perLoop && r.perLoop.length > 0) {
+        const cap = effectiveViewLoop ?? Number.POSITIVE_INFINITY;
+        const capped = r.perLoop.filter((p) => p.loop <= cap);
+        if (capped.length > 0) {
+          const last = capped[capped.length - 1];
+          if (typeof last.totalSec === "number" && last.totalSec > 0) {
+            accTimeSec = last.totalSec;
+          } else {
+            const sum = capped.reduce(
+              (acc, p) => acc + (typeof p.lapSec === "number" ? p.lapSec : 0),
+              0,
+            );
+            accTimeSec = sum > 0 ? sum : null;
+          }
+        }
+      }
+      const accTime = accTimeSec === null ? "" : formatHms(accTimeSec);
       return {
         ...r,
+        lastLap,
         laps,
         distanceKm: laps === null ? null : laps * loopKm,
+        accTime,
+        accTimeSec,
       };
     });
     return derived.sort((a, b) => compare(a, b, sortKey, sortDir));
@@ -392,8 +476,9 @@ export function LeaderboardDashboard({ eventId }: { eventId: string }) {
                 <td style={td}>{r.slowestLap || "—"}</td>
                 <td style={td}>{r.averageLap || "—"}</td>
                 <td style={td}>{r.total || "—"}</td>
+                <td style={tdNum}>{r.accTime || "—"}</td>
                 <td style={td}>
-                  {r.distanceKm === null ? "—" : `${r.distanceKm.toFixed(2)} km`}
+                  {r.distanceKm === null ? "—" : `${r.distanceKm.toFixed(1)} km`}
                 </td>
                 <td style={td}>{r.status || "—"}</td>
               </tr>
@@ -429,12 +514,4 @@ const tdNum: React.CSSProperties = {
   fontVariantNumeric: "tabular-nums",
   textAlign: "right",
   width: "4rem",
-};
-const playbackBtn: React.CSSProperties = {
-  padding: "0.3rem 0.6rem",
-  fontSize: "1rem",
-  border: "1px solid #ccc",
-  borderRadius: "0.3rem",
-  background: "white",
-  cursor: "pointer",
 };
