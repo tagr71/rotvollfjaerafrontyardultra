@@ -31,13 +31,32 @@ RACERESULT_BASE = os.getenv("RACERESULT_BASE", "https://my.raceresult.com")
 
 app = FastAPI(title="Race dashboards API")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Vite dev server
-    allow_credentials=False,
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
+# CORS configuration.
+#
+# * In development (``DEV=1``) we allow the Vite dev server on
+#   ``http://localhost:5173`` so ``npm run dev`` can talk to a separately
+#   running backend.
+# * In production we allow only origins explicitly listed in
+#   ``CORS_ORIGINS`` (comma-separated). For the single-origin Docker
+#   deploy where the SPA is bundled into this image (see the static
+#   mount at the bottom of the file), the same-origin policy applies
+#   and ``CORS_ORIGINS`` can be left empty.
+_dev_mode = os.getenv("DEV", "").strip().lower() in {"1", "true", "yes", "on"}
+_extra_origins = [
+    o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()
+]
+_cors_origins = [
+    *(["http://localhost:5173"] if _dev_mode else []),
+    *_extra_origins,
+]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET"],
+        allow_headers=["*"],
+    )
 
 
 def _validate_event_id(event_id: str) -> None:
@@ -48,6 +67,25 @@ def _validate_event_id(event_id: str) -> None:
         )
     if not event_id.isdigit():
         raise HTTPException(status_code=400, detail="event_id must be numeric")
+    if len(event_id) > 12:
+        raise HTTPException(status_code=400, detail="event_id is too long")
+
+
+# Listnames published by RaceResult templates are short identifiers like
+# ``Resultatliste``, ``LIVE``, ``02 - Result Lists|6 - Details``. Restrict
+# the user-supplied value to a conservative character set so it can
+# safely flow into outbound query strings and log lines.
+_LISTNAME_RE = re.compile(r"^[A-Za-z0-9 ._|\-]{1,80}$")
+
+
+def _validate_listname(listname: str | None) -> None:
+    if listname is None:
+        return
+    if not _LISTNAME_RE.match(listname):
+        raise HTTPException(
+            status_code=400,
+            detail="listname must be 1-80 chars of letters, digits, space, '.', '_', '|' or '-'",
+        )
 
 
 def _auth_headers() -> dict[str, str]:
@@ -598,6 +636,7 @@ async def results(
     we additionally fetch the "LIVE" list and merge in each runner's
     `lastLap` (LIVE is the only list that carries it), keyed by BIB.
     """
+    _validate_listname(listname)
     resolved = event_id or RACERESULT_EVENT_ID
     effective = listname or "Resultatliste"
     payload, event_name, event_location, event_date, event_time = await _fetch_list(
@@ -1213,5 +1252,42 @@ async def jerseys(
 
 @app.get("/", include_in_schema=False)
 async def root() -> RedirectResponse:
+    # If the production SPA bundle is mounted (see below), serve it.
+    # Otherwise fall back to the legacy API redirect (used when the
+    # backend runs standalone in dev with Vite on :5173).
+    if _DIST.is_dir():
+        from fastapi.responses import FileResponse
+        return FileResponse(_DIST / "index.html")
     return RedirectResponse(url="/api/participants/count")
+
+
+# ---------------------------------------------------------------------------
+# Production SPA mount
+# ---------------------------------------------------------------------------
+# When the Vite bundle exists (i.e. the Docker image baked it in at
+# /app/frontend/dist), serve it from the same FastAPI process so the
+# whole app lives behind a single origin / port. In local dev this
+# directory is absent and the block is skipped — Vite on :5173 keeps
+# proxying /api/* during development.
+_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+if _DIST.is_dir():
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    # Hashed bundle output goes under /assets — serve it directly.
+    _ASSETS = _DIST / "assets"
+    if _ASSETS.is_dir():
+        app.mount("/assets", StaticFiles(directory=_ASSETS), name="assets")
+
+    # SPA fallback: any unknown path that isn't an /api/* route returns
+    # index.html so client-side routing works. Real files under dist/
+    # (favicon, public images, etc.) are served as-is.
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def _spa_fallback(full_path: str) -> FileResponse:
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not Found")
+        candidate = _DIST / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(_DIST / "index.html")
 

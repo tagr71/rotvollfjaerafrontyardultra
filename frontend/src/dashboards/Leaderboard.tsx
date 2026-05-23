@@ -160,6 +160,35 @@ export function Leaderboard({ eventId }: { eventId: string }) {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [sortKey, setSortKey] = useState<SortKey>("rankNow");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
+  // Backyard events don't publish jersey-points data or per-loop diff
+  // rankings, and the "gap" cell collapses to laps-behind / DNF. Hide
+  // the columns that have no meaningful value in that mode.
+  const hiddenCols = useMemo<Set<string>>(
+    () =>
+      mode === "backyard"
+        ? new Set([
+            "gap",
+            "rankNow",
+            "greenPts",
+            "greenApiPts",
+            "pinkPts",
+            "diffSec",
+          ])
+        : new Set(),
+    [mode],
+  );
+  const visibleColumns = useMemo(
+    () => columns.filter((c) => !hiddenCols.has(c.key)),
+    [hiddenCols],
+  );
+  // If the current sort column is hidden, fall back to a sort key that
+  // is always visible. "totalRank" works for both modes.
+  useEffect(() => {
+    if (hiddenCols.has(sortKey)) {
+      setSortKey("totalRank");
+      setSortDir("asc");
+    }
+  }, [hiddenCols, sortKey]);
   // Group mode persists per event so a refresh keeps the same view.
   const [groupMode, setGroupModeState] = useState<"all" | "gender">(() => {
     if (typeof window === "undefined") return "all";
@@ -720,7 +749,7 @@ export function Leaderboard({ eventId }: { eventId: string }) {
     return (
       <thead>
         <tr style={{ background: "#f3f3f3" }}>
-          {columns.map((col) => {
+          {visibleColumns.map((col) => {
             const active = col.key === sortKey;
             const arrow = active ? (sortDir === "asc" ? " ▲" : " ▼") : "";
             return (
@@ -755,11 +784,13 @@ export function Leaderboard({ eventId }: { eventId: string }) {
         <td style={tdNum}>{r.bib}</td>
         <td style={td}>
           {r.name}
-          <JerseyBadges jerseys={jerseysForBib(r.bib)} />
+          {mode === "frontyard" && (
+            <JerseyBadges jerseys={jerseysForBib(r.bib)} />
+          )}
         </td>
         <td style={td}>{r.total || "—"}</td>
         <td style={tdNum}>{r.totalRank ?? "—"}</td>
-        <td style={td}>{r.gap || "—"}</td>
+        {!hiddenCols.has("gap") && <td style={td}>{r.gap || "—"}</td>}
         <td style={td}>{r.club}</td>
         <td style={td}>
           {countryAlpha2(r.country) ? (
@@ -778,27 +809,37 @@ export function Leaderboard({ eventId }: { eventId: string }) {
         <td style={td}>{r.sex}</td>
         <td style={tdNum}>{r.laps ?? "—"}</td>
         <td style={td}>{r.lastLap || "—"}</td>
-        <td style={tdNum}>{r.rankNow ?? "—"}</td>
-        <td
-          style={
-            r.greenPts !== r.greenApiPts
-              ? { ...tdNum, background: "#fef9c3" }
-              : tdNum
-          }
-        >
-          {r.greenPts ?? "—"}
-        </td>
-        <td
-          style={
-            r.greenPts !== r.greenApiPts
-              ? { ...tdNum, background: "#fef9c3" }
-              : tdNum
-          }
-        >
-          {r.greenApiPts ?? "—"}
-        </td>
-        <td style={tdNum}>{r.pinkPts ?? "—"}</td>
-        <td style={tdNum}>{r.diff || "—"}</td>
+        {!hiddenCols.has("rankNow") && (
+          <td style={tdNum}>{r.rankNow ?? "—"}</td>
+        )}
+        {!hiddenCols.has("greenPts") && (
+          <td
+            style={
+              r.greenPts !== r.greenApiPts
+                ? { ...tdNum, background: "#fef9c3" }
+                : tdNum
+            }
+          >
+            {r.greenPts ?? "—"}
+          </td>
+        )}
+        {!hiddenCols.has("greenApiPts") && (
+          <td
+            style={
+              r.greenPts !== r.greenApiPts
+                ? { ...tdNum, background: "#fef9c3" }
+                : tdNum
+            }
+          >
+            {r.greenApiPts ?? "—"}
+          </td>
+        )}
+        {!hiddenCols.has("pinkPts") && (
+          <td style={tdNum}>{r.pinkPts ?? "—"}</td>
+        )}
+        {!hiddenCols.has("diffSec") && (
+          <td style={tdNum}>{r.diff || "—"}</td>
+        )}
         <td style={td}>{r.fastestLap || "—"}</td>
         <td style={td}>{r.slowestLap || "—"}</td>
         <td style={td}>{r.averageLap || "—"}</td>
@@ -815,7 +856,7 @@ export function Leaderboard({ eventId }: { eventId: string }) {
     // Build per-column widths from the longest content across the given
     // rows (plus the header label) so two separate tables can be locked
     // to identical widths with `table-layout: fixed`.
-    return columns.map((col) => {
+    return visibleColumns.map((col) => {
       // Country renders a 24px flag image, not text -- give it a fixed slot.
       if (col.key === "country") return "3.5rem";
       // Header label with a little room for the sort arrow.
@@ -829,6 +870,17 @@ export function Leaderboard({ eventId }: { eventId: string }) {
               ? `${v.toFixed(1)} km`
               : String(v);
         if (text.length > maxLen) maxLen = text.length;
+      }
+      // The name cell may also render up to 3 jersey badges (frontyard only).
+      // Each badge is ~1.1rem wide with a small gap; reserve ~3ch per badge
+      // plus a small left margin so both gender tables agree on width.
+      if (col.key === "name" && mode === "frontyard") {
+        let maxBadges = 0;
+        for (const r of rows) {
+          const n = jerseysForBib(r.bib).length;
+          if (n > maxBadges) maxBadges = n;
+        }
+        if (maxBadges > 0) maxLen += 1 + maxBadges * 3;
       }
       // 1ch ≈ width of "0". Add padding for cell padding (~1.5ch).
       return `${maxLen + 2}ch`;

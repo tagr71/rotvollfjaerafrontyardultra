@@ -211,6 +211,78 @@ FastAPI backend on port 8000.
 `event_id` falls back to `RACERESULT_EVENT_ID` from `backend/.env` when
 omitted.
 
+## Deploy with Docker
+
+The repository ships a multi-stage [Dockerfile](Dockerfile) that builds
+the Vite/React bundle in a Node stage and serves it from the FastAPI
+backend in a Python stage — one image, one process, one port.
+
+### Build locally
+
+```powershell
+docker build -t rotvoll:latest .
+```
+
+The first build pulls `node:20-alpine` and `python:3.12-slim` from
+Docker Hub; subsequent builds are cached. Expect a small image
+(~150 MB) because the Node toolchain is discarded after `vite build`.
+
+### Run locally
+
+```powershell
+docker run --rm -p 8000:8000 rotvoll:latest
+```
+
+Open http://localhost:8000 — the SPA loads and `/api/*` requests hit
+the FastAPI inside the same container. No CORS or reverse-proxy
+configuration is needed in this single-origin layout.
+
+Stop with `Ctrl+C`.
+
+All RaceResult settings are optional: leave them unset and type the
+event ID in the UI, or bake one in via either an env file or inline
+flags:
+
+```powershell
+# Option A — inline env vars
+docker run --rm -p 8000:8000 `
+  -e RACERESULT_EVENT_ID=12345 `
+  rotvoll:latest
+
+# Option B — env file (copy backend/.env.example to backend/.env first)
+docker run --rm -p 8000:8000 --env-file backend/.env rotvoll:latest
+```
+
+### Push to a registry (e.g. GitHub Container Registry)
+
+```powershell
+# Log in once with a GitHub Personal Access Token that has write:packages
+docker login ghcr.io -u <github-username>
+
+docker tag rotvoll:latest ghcr.io/<github-username>/rotvoll:latest
+docker push ghcr.io/<github-username>/rotvoll:latest
+```
+
+### Deploy to a container PaaS
+
+Any container-aware platform can pull the image and run it. The
+container honours `$PORT` so platforms that assign a port at runtime
+(Cloud Run, Render, Fly.io, Azure Container Apps) work without
+modification. Provide configuration via environment variables:
+
+| Variable              | Purpose                                                                  |
+| --------------------- | ------------------------------------------------------------------------ |
+| `RACERESULT_EVENT_ID` | Default event ID when `?event_id=` is not supplied.                      |
+| `RACERESULT_API_KEY`  | Optional bearer token for RaceResult.                                    |
+| `RACERESULT_BASE`     | Override the RaceResult host (default `https://my.raceresult.com`).      |
+| `CORS_ORIGINS`        | Comma-separated extra allowed origins. Not needed for single-origin deploys. |
+| `DEV`                 | When `1`/`true`, also allow `http://localhost:5173` (Vite dev server) as a CORS origin. Leave unset in production. |
+| `PORT`                | Override the listening port (default `8000`).                            |
+
+The container runs as a non-root user (`app`) and has no persistent
+state — every restart starts clean and re-fetches data from RaceResult
+on demand.
+
 ## Testing
 
 The jersey ranking pipeline ships with a deterministic end-to-end unit
