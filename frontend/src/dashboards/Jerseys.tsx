@@ -4,87 +4,26 @@ import {
   formatHms,
   frontyardElapsedAtLoopStart,
   frontyardState,
+  jerseyDetailKey,
   osloWallClockToInstant,
   playbackBtn,
   useNowTick,
   useTimerSettings,
   useViewLoop,
 } from "./timerCore";
-
-type JerseyEntry = {
-  bib: string;
-  name: string;
-  club: string;
-  sex: string;
-  points?: number;
-  perLoop?: { loop: number; points?: number; time?: string; lapSec?: number; totalSec?: number }[];
-  totalSec?: number;
-  lapsCompleted?: number;
-};
-
-type JerseysPayload = {
-  eventName?: string;
-  raceFinished?: boolean;
-  green: JerseyEntry[];
-  pink: JerseyEntry[];
-  yellow: JerseyEntry[];
-};
-
-type Sex = "M" | "K";
-
-/** Sum the runner's perLoop points up to (and including) `maxLoop`.
- * Falls back to the backend-reported total if no perLoop data exists. */
-function sumUpto(entry: JerseyEntry, maxLoop: number): number {
-  if (entry.perLoop && entry.perLoop.length > 0) {
-    return entry.perLoop
-      .filter((p) => p.loop <= maxLoop)
-      .reduce((acc, p) => acc + (p.points ?? 0), 0);
-  }
-  return entry.points ?? 0;
-}
-
-/** Points the runner scored in exactly `loop`, or 0 if none. Used as the
- * tie-breaker for the pink/green jerseys when totals are equal. */
-function pointsAtLoop(entry: JerseyEntry, loop: number): number {
-  const p = (entry.perLoop ?? []).find((x) => x.loop === loop);
-  return p?.points ?? 0;
-}
-
-/** Lap time (seconds) the runner ran in exactly `loop`, or 0 if missing.
- * Used as the tie-breaker for the yellow jersey when total times tie. */
-function lapSecAtLoop(entry: JerseyEntry, loop: number): number {
-  const p = (entry.perLoop ?? []).find((x) => x.loop === loop);
-  return p?.lapSec ?? 0;
-}
-
-/** Accumulated race time (seconds) from loop 1 through `maxLoop`. Prefers
- * the per-loop cumulative `totalSec` at the cap; falls back to summing
- * `lapSec` values; and finally to the entry-level `totalSec` when no
- * per-loop data is available. */
-function accTimeUpto(entry: JerseyEntry, maxLoop: number): number {
-  const capped = (entry.perLoop ?? []).filter((p) => p.loop <= maxLoop);
-  if (capped.length > 0) {
-    const last = capped[capped.length - 1];
-    if (typeof last.totalSec === "number" && last.totalSec > 0) {
-      return last.totalSec;
-    }
-    const sum = capped.reduce(
-      (acc, p) => acc + (typeof p.lapSec === "number" ? p.lapSec : 0),
-      0,
-    );
-    if (sum > 0) return sum;
-  }
-  return entry.totalSec ?? 0;
-}
-
-/** Highest loop number with any recorded data on the runner. */
-function lastCompletedLoop(entry: JerseyEntry): number {
-  let max = 0;
-  for (const p of entry.perLoop ?? []) {
-    if (p.loop > max) max = p.loop;
-  }
-  return max;
-}
+import {
+  buildSexLookup,
+  lapSecAtLoop,
+  pointsAtLoop,
+  rankByPoints,
+  rankYellow,
+  resolveSex,
+  sumUpto,
+  type DisplayRow,
+  type JerseyEntry,
+  type JerseysPayload,
+  type Sex,
+} from "./jerseyRanking";
 
 const TABLE_BG: Record<"pink" | "green" | "yellow", string> = {
   pink: "#fce7f3",
@@ -144,16 +83,6 @@ function JerseyBadges({ jerseys }: { jerseys?: ("pink" | "green" | "yellow")[] }
   );
 }
 
-type DisplayRow = {
-  rank: number;
-  bib: string;
-  name: string;
-  club: string;
-  value: string;
-  sub?: string;
-  jerseys?: ("pink" | "green" | "yellow")[];
-};
-
 function JerseyTable({
   jersey,
   sex,
@@ -206,98 +135,69 @@ function JerseyTable({
           </span>
         )}
       </div>
-      <table
+      <div
         style={{
-          borderCollapse: "collapse",
-          width: "100%",
-          tableLayout: "fixed",
-          fontSize: "0.95rem",
+          // Cap visible height to roughly 10 rows + sticky header; the
+          // rest of the field is reachable via the vertical scrollbar.
+          maxHeight: "23rem",
+          overflowY: "auto",
         }}
       >
-        <colgroup>
-          <col style={{ width: "2.5rem" }} />
-          <col style={{ width: "3rem" }} />
-          <col />
-          <col />
-          <col style={{ width: "6rem" }} />
-        </colgroup>
-        <thead>
-          <tr style={{ background: "#fafafa" }}>
-            <th style={th}>#</th>
-            <th style={th}>Bib</th>
-            <th style={{ ...th, textAlign: "left" }}>Name</th>
-            <th style={{ ...th, textAlign: "left" }}>Club</th>
-            <th style={th}>{valueHeader}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.length === 0 ? (
-            <tr>
-              <td colSpan={5} style={{ ...td, color: "#888", textAlign: "center" }}>
-                No data
-              </td>
+        <table
+          style={{
+            borderCollapse: "collapse",
+            width: "100%",
+            tableLayout: "fixed",
+            fontSize: "0.95rem",
+          }}
+        >
+          <colgroup>
+            <col style={{ width: "2.5rem" }} />
+            <col style={{ width: "3rem" }} />
+            <col />
+            <col />
+            <col style={{ width: "6rem" }} />
+          </colgroup>
+          <thead>
+            <tr style={{ background: "#fafafa" }}>
+              <th style={thSticky}>#</th>
+              <th style={thSticky}>Bib</th>
+              <th style={{ ...thSticky, textAlign: "left" }}>Name</th>
+              <th style={{ ...thSticky, textAlign: "left" }}>Club</th>
+              <th style={thSticky}>{valueHeader}</th>
             </tr>
-          ) : (
-            rows.map((r, i) => (
-              <tr key={`${r.bib}-${i}`} style={i % 2 ? { background: "#fafafa" } : undefined}>
-                <td style={tdNum}>{r.rank}</td>
-                <td style={tdNum}>{r.bib}</td>
-                <td style={td}>
-                  {r.name}
-                  <JerseyBadges jerseys={r.jerseys} />
-                </td>
-                <td style={td}>{r.club}</td>
-                <td style={tdNum}>
-                  {r.value}
-                  {r.sub && (
-                    <span style={{ color: "#888", fontSize: "0.85em" }}> {r.sub}</span>
-                  )}
+          </thead>
+          <tbody>
+            {rows.length === 0 ? (
+              <tr>
+                <td colSpan={5} style={{ ...td, color: "#888", textAlign: "center" }}>
+                  No data
                 </td>
               </tr>
-            ))
-          )}
-        </tbody>
-      </table>
+            ) : (
+              rows.map((r, i) => (
+                <tr key={`${r.bib}-${i}`} style={i % 2 ? { background: "#fafafa" } : undefined}>
+                  <td style={tdNum}>{r.rank}</td>
+                  <td style={tdNum}>{r.bib}</td>
+                  <td style={td}>
+                    {r.name}
+                    <JerseyBadges jerseys={r.jerseys} />
+                  </td>
+                  <td style={td}>{r.club}</td>
+                  <td style={tdNum}>
+                    {r.value}
+                    {r.sub && (
+                      <span style={{ color: "#888", fontSize: "0.85em" }}> {r.sub}</span>
+                    )}
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
-}
-
-/** Resolve a runner's sex from supplementary lookup maps. The yellow
- * (and most green) lists publish a sex column, but the pink list does
- * not, so we cross-reference the other lists by bib. */
-function resolveSex(entry: JerseyEntry, lookup: Map<string, string>): string {
-  if (entry.sex === "M" || entry.sex === "K") return entry.sex;
-  return lookup.get(entry.bib) ?? entry.sex ?? "";
-}
-
-/** Rank entries by accumulated points (descending) up to `cap`, split by
- * sex, capped at the top 10. Shared between the pink and green jersey
- * standings — both use the same per-loop points model. Ties on total
- * points are broken by the points scored on the snapshot loop itself. */
-function rankByPoints(
-  entries: JerseyEntry[],
-  sexLookup: Map<string, string>,
-  cap: number,
-): Record<Sex, DisplayRow[]> {
-  const out: Record<Sex, DisplayRow[]> = { M: [], K: [] };
-  for (const sex of ["K", "M"] as Sex[]) {
-    const ranked = entries
-      .filter((e) => resolveSex(e, sexLookup) === sex)
-      .map((e) => ({ e, pts: sumUpto(e, cap) }))
-      .filter((x) => x.pts > 0)
-      .sort((a, b) => {
-        if (b.pts !== a.pts) return b.pts - a.pts;
-        return pointsAtLoop(b.e, cap) - pointsAtLoop(a.e, cap);
-      });
-    out[sex] = ranked.slice(0, 10).map(({ e, pts }, i) => ({
-      rank: i + 1,
-      bib: e.bib,
-      name: e.name,
-      club: e.club,
-      value: `${pts} p`,
-    }));
-  }
-  return out;
 }
 
 export function Jerseys({ eventId, eventName }: { eventId: string; eventName?: string }) {
@@ -310,10 +210,24 @@ export function Jerseys({ eventId, eventName }: { eventId: string; eventName?: s
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   // Top-level view selector: overview = the original 2x3 grid; the other
   // values drop into a single-jersey detail view (Women on top, Men below)
-  // with per-loop columns alongside the accumulated total.
-  const [detailView, setDetailView] = useState<"overview" | "pink" | "green" | "yellow">(
-    "overview",
-  );
+  // with per-loop columns alongside the accumulated total. Persisted per
+  // event so a refresh keeps the user on the same view.
+  type DetailView = "overview" | "pink" | "green" | "yellow";
+  const [detailView, setDetailViewState] = useState<DetailView>(() => {
+    if (typeof window === "undefined") return "overview";
+    const raw = window.localStorage.getItem(jerseyDetailKey(eventId));
+    if (raw === "pink" || raw === "green" || raw === "yellow" || raw === "overview")
+      return raw;
+    return "overview";
+  });
+  const setDetailView = (v: DetailView) => {
+    setDetailViewState(v);
+    try {
+      window.localStorage.setItem(jerseyDetailKey(eventId), v);
+    } catch {
+      /* localStorage may be unavailable */
+    }
+  };
 
   // Compute when the next loop boundary will pass so the next poll can be
   // scheduled to fire shortly after it (giving RaceResult a few seconds to
@@ -453,16 +367,13 @@ export function Jerseys({ eventId, eventName }: { eventId: string; eventName?: s
 
   // Sex lookup combines whatever sex info the green and yellow lists
   // provide, so the pink list (which omits sex) can still be classified.
-  const sexLookup = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const e of data?.green ?? []) {
-      if (e.sex === "M" || e.sex === "K") map.set(e.bib, e.sex);
-    }
-    for (const e of data?.yellow ?? []) {
-      if (e.sex === "M" || e.sex === "K") map.set(e.bib, e.sex);
-    }
-    return map;
-  }, [data]);
+  const sexLookup = useMemo(
+    () =>
+      buildSexLookup(
+        data ?? { green: [], pink: [], yellow: [] },
+      ),
+    [data],
+  );
 
   // Effective cut-off loops: the displayed standings always reflect the
   // current `snapshotLoop` (either the replay scrubber value or, in live
@@ -474,58 +385,16 @@ export function Jerseys({ eventId, eventName }: { eventId: string; eventName?: s
     snapshotLoop !== null ? Math.min(jerseyPink, snapshotLoop) : jerseyPink;
 
   // Yellow: ranked by accumulated total time (ascending — fastest first).
-  // In replay mode, the total is the cumulative time from loop 1 through
-  // the selected loop (so the standings reproduce the snapshot at that
-  // moment); in live mode it's the runner's full-race total. Ties on the
-  // ranking time are broken by the lap time on the latest counted loop.
-  // We filter to runners who had completed at least `snapshotLoop` loops.
-  const yellowBySex = useMemo(() => {
-    const out: Record<Sex, DisplayRow[]> = { M: [], K: [] };
-    for (const sex of ["K", "M"] as Sex[]) {
-      const filtered = (data?.yellow ?? []).filter((e) => {
-        if (resolveSex(e, sexLookup) !== sex || (e.totalSec ?? 0) <= 0) return false;
-        if (snapshotLoop !== null) {
-          const lapsCompleted =
-            typeof e.lapsCompleted === "number" ? e.lapsCompleted : 0;
-          if (lapsCompleted < snapshotLoop) return false;
-        }
-        return true;
-      });
-      const rankingTime = (e: JerseyEntry): number =>
-        effectiveViewLoop !== null
-          ? accTimeUpto(e, effectiveViewLoop)
-          : e.totalSec ?? 0;
-      const sorted = [...filtered].sort((a, b) => {
-        const ta = rankingTime(a);
-        const tb = rankingTime(b);
-        if (ta !== tb) return ta - tb;
-        // Tie: faster lap on the last counted loop wins. In replay, that's
-        // the scrubbed loop; otherwise, the larger of the two last-loop
-        // indices so we always compare on the most recent shared loop.
-        const tieLoop =
-          effectiveViewLoop !== null
-            ? effectiveViewLoop
-            : Math.max(lastCompletedLoop(a), lastCompletedLoop(b), 1);
-        return lapSecAtLoop(a, tieLoop) - lapSecAtLoop(b, tieLoop);
-      });
-      out[sex] = sorted.slice(0, 10).map((e, i) => ({
-        rank: i + 1,
-        bib: e.bib,
-        name: e.name,
-        club: e.club,
-        value: formatHms(rankingTime(e)),
-        sub:
-          typeof e.lapsCompleted === "number"
-            ? `(${
-                effectiveViewLoop !== null
-                  ? Math.min(e.lapsCompleted, effectiveViewLoop)
-                  : e.lapsCompleted
-              } loops)`
-            : undefined,
-      }));
-    }
-    return out;
-  }, [data, sexLookup, snapshotLoop, effectiveViewLoop]);
+  // The ranking uses cumulative time up to the *effective* yellow snapshot
+  // loop, which is `snapshotLoop` capped at `jerseyYellow` — so once the
+  // yellow competition's last loop is in the books, the holder is frozen
+  // for the remainder of the race / for any later replay loop.
+  const yellowEffectiveLoop: number | null =
+    snapshotLoop !== null ? Math.min(snapshotLoop, jerseyYellow) : null;
+  const yellowBySex = useMemo(
+    () => rankYellow(data?.yellow ?? [], sexLookup, yellowEffectiveLoop),
+    [data, sexLookup, yellowEffectiveLoop],
+  );
 
   // Green: backend supplies per-loop points + total. Cap at greenCap.
   // Tie-break: most points on the snapshot loop.
@@ -649,6 +518,27 @@ export function Jerseys({ eventId, eventName }: { eventId: string; eventName?: s
       )}
       {maxLoop >= 1 && (
         <div
+          role="group"
+          aria-label="Replay controls"
+          tabIndex={-1}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowLeft") {
+              e.preventDefault();
+              setViewLoop(Math.max(1, (effectiveViewLoop ?? maxLoop) - 1));
+            } else if (e.key === "ArrowRight") {
+              e.preventDefault();
+              setViewLoop(Math.min(maxLoop, (effectiveViewLoop ?? 0) + 1));
+            } else if (e.key === "Home") {
+              e.preventDefault();
+              setViewLoop(1);
+            } else if (e.key === "End") {
+              e.preventDefault();
+              setViewLoop(maxLoop);
+            } else if (e.key.toLowerCase() === "l") {
+              e.preventDefault();
+              setViewLoop(null);
+            }
+          }}
           style={{
             display: "flex",
             alignItems: "center",
@@ -1072,6 +962,13 @@ const th: React.CSSProperties = {
   borderBottom: "1px solid #ddd",
   textAlign: "right",
   fontVariantNumeric: "tabular-nums",
+};
+const thSticky: React.CSSProperties = {
+  ...th,
+  position: "sticky",
+  top: 0,
+  background: "#fafafa",
+  zIndex: 1,
 };
 const td: React.CSSProperties = {
   padding: "0.35rem 0.6rem",

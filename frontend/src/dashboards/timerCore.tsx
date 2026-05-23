@@ -88,6 +88,12 @@ export function jerseyYellowKey(eventId: string) {
 export function viewLoopKey(eventId: string) {
   return `raceresult.viewLoop.${eventId}`;
 }
+export function jerseyDetailKey(eventId: string) {
+  return `raceresult.jerseyDetail.${eventId}`;
+}
+export function leaderboardGroupKey(eventId: string) {
+  return `raceresult.leaderboardGroup.${eventId}`;
+}
 
 /** Cumulative seconds from race start to the START of loop `loopNumber` in
  * frontyard mode (1-indexed). Loop 1 starts at 0 s. */

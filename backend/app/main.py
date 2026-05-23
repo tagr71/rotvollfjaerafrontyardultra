@@ -2,6 +2,7 @@
 endpoints for the local dashboards (participant count, leaderboard, ...)."""
 from __future__ import annotations
 
+import logging
 import os
 import re
 import ssl
@@ -30,13 +31,32 @@ RACERESULT_BASE = os.getenv("RACERESULT_BASE", "https://my.raceresult.com")
 
 app = FastAPI(title="Race dashboards API")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Vite dev server
-    allow_credentials=False,
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
+# CORS configuration.
+#
+# * In development (``DEV=1``) we allow the Vite dev server on
+#   ``http://localhost:5173`` so ``npm run dev`` can talk to a separately
+#   running backend.
+# * In production we allow only origins explicitly listed in
+#   ``CORS_ORIGINS`` (comma-separated). For the single-origin Docker
+#   deploy where the SPA is bundled into this image (see the static
+#   mount at the bottom of the file), the same-origin policy applies
+#   and ``CORS_ORIGINS`` can be left empty.
+_dev_mode = os.getenv("DEV", "").strip().lower() in {"1", "true", "yes", "on"}
+_extra_origins = [
+    o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()
+]
+_cors_origins = [
+    *(["http://localhost:5173"] if _dev_mode else []),
+    *_extra_origins,
+]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET"],
+        allow_headers=["*"],
+    )
 
 
 def _validate_event_id(event_id: str) -> None:
@@ -47,6 +67,25 @@ def _validate_event_id(event_id: str) -> None:
         )
     if not event_id.isdigit():
         raise HTTPException(status_code=400, detail="event_id must be numeric")
+    if len(event_id) > 12:
+        raise HTTPException(status_code=400, detail="event_id is too long")
+
+
+# Listnames published by RaceResult templates are short identifiers like
+# ``Resultatliste``, ``LIVE``, ``02 - Result Lists|6 - Details``. Restrict
+# the user-supplied value to a conservative character set so it can
+# safely flow into outbound query strings and log lines.
+_LISTNAME_RE = re.compile(r"^[A-Za-z0-9 ._|\-]{1,80}$")
+
+
+def _validate_listname(listname: str | None) -> None:
+    if listname is None:
+        return
+    if not _LISTNAME_RE.match(listname):
+        raise HTTPException(
+            status_code=400,
+            detail="listname must be 1-80 chars of letters, digits, space, '.', '_', '|' or '-'",
+        )
 
 
 def _auth_headers() -> dict[str, str]:
@@ -597,6 +636,7 @@ async def results(
     we additionally fetch the "LIVE" list and merge in each runner's
     `lastLap` (LIVE is the only list that carries it), keyed by BIB.
     """
+    _validate_listname(listname)
     resolved = event_id or RACERESULT_EVENT_ID
     effective = listname or "Resultatliste"
     payload, event_name, event_location, event_date, event_time = await _fetch_list(
@@ -702,6 +742,100 @@ async def health() -> dict[str, str]:
 
 _GREEN_LOOP_RE = re.compile(r"^PoengRunde\s*0*(\d+)$", re.IGNORECASE)
 _PINK_LOOP_RE = re.compile(r"^MellomtidPoengRunde\s*0*(\d+)$", re.IGNORECASE)
+
+# Default Green jersey points ladder: 1st across the loop = 10 points,
+# 2nd = 8, …, 6th = 1. Configurable per-request via the `ladder` query
+# parameter on /api/jerseys.
+_DEFAULT_GREEN_LADDER: tuple[int, ...] = (10, 8, 6, 4, 2, 1)
+
+
+def _parse_ladder(spec: str | None) -> tuple[int, ...]:
+    """Parse a comma-separated points ladder, e.g. ``"10,8,6,4,2,1"``.
+
+    Returns the default ladder if `spec` is falsy or unparseable.
+    """
+    if not spec:
+        return _DEFAULT_GREEN_LADDER
+    try:
+        values = tuple(int(p.strip()) for p in spec.split(",") if p.strip())
+    except ValueError:
+        return _DEFAULT_GREEN_LADDER
+    return values or _DEFAULT_GREEN_LADDER
+
+
+_JERSEY_LOG = logging.getLogger("jerseys")
+
+
+def _compute_loop_points(
+    lap_times_by_bib: dict[str, list[dict[str, Any]]],
+    ladder: tuple[int, ...],
+    *,
+    group_by_bib: dict[str, str] | None = None,
+    exclude_bibs: set[str] | None = None,
+) -> dict[str, dict[int, int]]:
+    """Rank runners by lap time per loop and award ladder points.
+
+    For each loop the runners with the fastest ``lapSec`` get the points
+    from ``ladder`` in order. Returns ``{bib: {loop_n: points_computed}}``.
+
+    Ranking is **ordinal**: every position gets a distinct ladder slot,
+    with secondary sort by bib (ascending) as a deterministic tie-break
+    when ``lapSec`` values are equal. This mirrors RaceResult's own
+    behaviour (it tie-breaks by sub-second chip time, which the
+    published list rounds away — bib order is the closest deterministic
+    proxy we have).
+
+    Whenever two or more runners share the same ``lapSec`` inside a
+    (group, loop), a warning is logged so the discrepancy is auditable.
+
+    Parameters
+    ----------
+    group_by_bib:
+        If given, runners are ranked separately within each group key
+        (e.g. by sex). Runners whose bib is missing are placed in ``""``.
+    exclude_bibs:
+        Optional set of bibs to skip entirely (e.g. DNF/DNS/DQ runners).
+    """
+    skip = exclude_bibs or set()
+    # Collect (bib, lapSec) per (group, loop).
+    by_key: dict[tuple[str, int], list[tuple[str, float]]] = {}
+    for bib, laps in lap_times_by_bib.items():
+        if bib in skip:
+            continue
+        group = (group_by_bib or {}).get(bib, "") if group_by_bib else ""
+        for lap in laps:
+            loop = int(lap.get("loop") or 0)
+            sec = lap.get("lapSec")
+            if loop <= 0 or not isinstance(sec, (int, float)) or sec <= 0:
+                continue
+            by_key.setdefault((group, loop), []).append((bib, float(sec)))
+    out: dict[str, dict[int, int]] = {}
+    for (group, loop), entries in by_key.items():
+        # Secondary sort by bib (numeric where possible, else string) so
+        # ties resolve deterministically.
+        def bib_key(b: str) -> tuple[int, str]:
+            try:
+                return (int(b), b)
+            except ValueError:
+                return (10**9, b)
+
+        entries.sort(key=lambda e: (e[1], bib_key(e[0])))
+        # Detect and log ties.
+        seen: dict[float, list[str]] = {}
+        for bib, sec in entries:
+            seen.setdefault(sec, []).append(bib)
+        for sec, tied in seen.items():
+            if len(tied) > 1:
+                _JERSEY_LOG.warning(
+                    "tie in group=%r loop=%d at %.3fs between bibs=%s",
+                    group, loop, sec, tied,
+                )
+        for i, (bib, _sec) in enumerate(entries):
+            if i < len(ladder):
+                pts = int(ladder[i])
+                if pts:
+                    out.setdefault(bib, {})[loop] = pts
+    return out
 
 
 def _parse_lap_times(
@@ -850,7 +984,10 @@ def _safe_int(text: str) -> int:
 
 
 @app.get("/api/jerseys")
-async def jerseys(event_id: str | None = None) -> dict[str, object]:
+async def jerseys(
+    event_id: str | None = None,
+    ladder: str | None = None,
+) -> dict[str, object]:
     """Return the per-jersey ranking tables for a frontyard event.
 
     Reads the three RaceResult lists that publish jersey points directly:
@@ -864,9 +1001,15 @@ async def jerseys(event_id: str | None = None) -> dict[str, object]:
     The response shape is:
     `{ eventName, green: [...], pink: [...], yellow: [...] }`. Each entry
     carries `{bib, name, club, country, sex, points|totalSec, perLoop?}`.
+
+    For Green, each entry also carries a parallel `pointsComputed` total
+    and `perLoop[].pointsComputed` derived locally by ranking runners by
+    their per-lap time (from the Details list) and awarding the points
+    ladder (default ``10,8,6,4,2,1``; override via ``?ladder=...``).
     """
     resolved = event_id or RACERESULT_EVENT_ID
     _validate_event_id(resolved)
+    points_ladder = _parse_ladder(ladder)
 
     event_name = ""
 
@@ -1017,6 +1160,58 @@ async def jerseys(event_id: str | None = None) -> dict[str, object]:
             if laps:
                 e["perLoop"] = laps
 
+    # Locally compute Green points from per-lap times so the caller can
+    # compare against the values published by RaceResult. Each green
+    # entry gets a `pointsComputed` total and `perLoop[i].pointsComputed`
+    # for every loop the runner completed.
+    if lap_times_by_bib:
+        sex_by_bib = {
+            bib: (ident.get("sex") or "").strip().lower()
+            for bib, ident in live_lookup.items()
+        }
+        # Skip DNF/DNS/DQ runners when ranking. We read statuses from the
+        # flattened LIVE list (same source as `raceFinished`).
+        excluded_bibs: set[str] = set()
+        if live_payload is not None:
+            out_pattern = re.compile(r"dnf|dns|dq|withdrawn", re.IGNORECASE)
+            for r in _flatten_results(live_payload):
+                status = str(r.get("status") or "")
+                if status and out_pattern.search(status):
+                    bib = str(r.get("bib") or "")
+                    if bib:
+                        excluded_bibs.add(bib)
+        if excluded_bibs:
+            _JERSEY_LOG.info(
+                "excluding bibs from local Green computation: %s",
+                sorted(excluded_bibs),
+            )
+        computed_by_bib = _compute_loop_points(
+            lap_times_by_bib,
+            points_ladder,
+            group_by_bib=sex_by_bib,
+            exclude_bibs=excluded_bibs,
+        )
+        for e in green:
+            bib = str(e.get("bib", ""))
+            per_loop_computed = computed_by_bib.get(bib, {})
+            total = 0
+            for lp in e.get("perLoop", []):
+                loop_n = int(lp.get("loop") or 0)
+                pts = int(per_loop_computed.get(loop_n, 0))
+                lp["pointsComputed"] = pts
+                total += pts
+            # Pad with extra entries for loops the runner ran but where
+            # the API had no PoengRunde column (rare, but keeps the two
+            # sources comparable).
+            existing_loops = {int(lp.get("loop") or 0) for lp in e.get("perLoop", [])}
+            for loop_n, pts in per_loop_computed.items():
+                if loop_n not in existing_loops:
+                    e.setdefault("perLoop", []).append(
+                        {"loop": loop_n, "points": 0, "pointsComputed": int(pts)}
+                    )
+                    total += int(pts)
+            e["pointsComputed"] = total
+
     for entries in (green, pink, yellow):
         backfill(entries)
 
@@ -1057,5 +1252,42 @@ async def jerseys(event_id: str | None = None) -> dict[str, object]:
 
 @app.get("/", include_in_schema=False)
 async def root() -> RedirectResponse:
+    # If the production SPA bundle is mounted (see below), serve it.
+    # Otherwise fall back to the legacy API redirect (used when the
+    # backend runs standalone in dev with Vite on :5173).
+    if _DIST.is_dir():
+        from fastapi.responses import FileResponse
+        return FileResponse(_DIST / "index.html")
     return RedirectResponse(url="/api/participants/count")
+
+
+# ---------------------------------------------------------------------------
+# Production SPA mount
+# ---------------------------------------------------------------------------
+# When the Vite bundle exists (i.e. the Docker image baked it in at
+# /app/frontend/dist), serve it from the same FastAPI process so the
+# whole app lives behind a single origin / port. In local dev this
+# directory is absent and the block is skipped — Vite on :5173 keeps
+# proxying /api/* during development.
+_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+if _DIST.is_dir():
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    # Hashed bundle output goes under /assets — serve it directly.
+    _ASSETS = _DIST / "assets"
+    if _ASSETS.is_dir():
+        app.mount("/assets", StaticFiles(directory=_ASSETS), name="assets")
+
+    # SPA fallback: any unknown path that isn't an /api/* route returns
+    # index.html so client-side routing works. Real files under dist/
+    # (favicon, public images, etc.) are served as-is.
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def _spa_fallback(full_path: str) -> FileResponse:
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not Found")
+        candidate = _DIST / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(_DIST / "index.html")
 

@@ -5,6 +5,8 @@ import {
   FRONTYARD_MAX_CAP,
   formatHms,
   frontyardElapsedAtLoopStart,
+  frontyardState,
+  leaderboardGroupKey,
   osloWallClockToInstant,
   playbackBtn,
   useTimerSettings,
@@ -37,7 +39,15 @@ type DerivedRow = ResultRow & {
   distanceKm: number | null;
   accTime: string;
   accTimeSec: number | null;
+  diff: string;
+  diffSec: number | null;
+  rankNow: number | null;
+  greenPts: number | null;
+  greenApiPts: number | null;
+  pinkPts: number | null;
 };
+
+type JerseyPointsByBib = Map<string, Map<number, number>>;
 
 const REFRESH_MS = 30_000;
 
@@ -88,19 +98,24 @@ type SortKey = keyof DerivedRow;
 type SortDir = "asc" | "desc";
 
 const columns: { key: SortKey; label: string; numeric?: boolean }[] = [
-  { key: "totalRank", label: "Total Rank", numeric: true },
   { key: "bib", label: "Bib", numeric: true },
   { key: "name", label: "Full Name" },
+  { key: "total", label: "Total" },
+  { key: "totalRank", label: "Total Rank", numeric: true },
+  { key: "gap", label: "Gap" },
   { key: "club", label: "Club" },
   { key: "country", label: "Country" },
   { key: "sex", label: "Gender" },
   { key: "laps", label: "Laps", numeric: true },
-  { key: "gap", label: "Gap" },
   { key: "lastLap", label: "Last" },
+  { key: "rankNow", label: "Rank Last", numeric: true },
+  { key: "greenPts", label: "Green", numeric: true },
+  { key: "greenApiPts", label: "GreenAPI", numeric: true },
+  { key: "pinkPts", label: "PinkAPI", numeric: true },
+  { key: "diffSec", label: "Diff", numeric: true },
   { key: "fastestLap", label: "Fastest" },
   { key: "slowestLap", label: "Slowest" },
   { key: "averageLap", label: "Average" },
-  { key: "total", label: "Total Time" },
   { key: "accTimeSec", label: "Acc. Time", numeric: true },
   { key: "distanceKm", label: "Acc. Distance" },
   { key: "status", label: "Status" },
@@ -129,16 +144,65 @@ function compare(a: DerivedRow, b: DerivedRow, key: SortKey, dir: SortDir): numb
 }
 
 export function Leaderboard({ eventId }: { eventId: string }) {
-  const { mode, startTime, fyLock, fyMax } = useTimerSettings(eventId);
+  const { mode, startTime, fyLock, fyMax, jerseyGreen, jerseyPink, jerseyYellow } =
+    useTimerSettings(eventId);
   const { viewLoop, setViewLoop } = useViewLoop(eventId);
   const [rows, setRows] = useState<ResultRow[]>([]);
+  const [greenByBib, setGreenByBib] = useState<JerseyPointsByBib>(new Map());
+  const [greenApiByBib, setGreenApiByBib] = useState<JerseyPointsByBib>(
+    new Map(),
+  );
+  const [pinkByBib, setPinkByBib] = useState<JerseyPointsByBib>(new Map());
   const [raceFinished, setRaceFinished] = useState(false);
   const [eventName, setEventName] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [sortKey, setSortKey] = useState<SortKey>("totalRank");
+  const [sortKey, setSortKey] = useState<SortKey>("rankNow");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
+  // Backyard events don't publish jersey-points data or per-loop diff
+  // rankings, and the "gap" cell collapses to laps-behind / DNF. Hide
+  // the columns that have no meaningful value in that mode.
+  const hiddenCols = useMemo<Set<string>>(
+    () =>
+      mode === "backyard"
+        ? new Set([
+            "gap",
+            "rankNow",
+            "greenPts",
+            "greenApiPts",
+            "pinkPts",
+            "diffSec",
+          ])
+        : new Set(),
+    [mode],
+  );
+  const visibleColumns = useMemo(
+    () => columns.filter((c) => !hiddenCols.has(c.key)),
+    [hiddenCols],
+  );
+  // If the current sort column is hidden, fall back to a sort key that
+  // is always visible. "totalRank" works for both modes.
+  useEffect(() => {
+    if (hiddenCols.has(sortKey)) {
+      setSortKey("totalRank");
+      setSortDir("asc");
+    }
+  }, [hiddenCols, sortKey]);
+  // Group mode persists per event so a refresh keeps the same view.
+  const [groupMode, setGroupModeState] = useState<"all" | "gender">(() => {
+    if (typeof window === "undefined") return "all";
+    const raw = window.localStorage.getItem(leaderboardGroupKey(eventId));
+    return raw === "gender" ? "gender" : "all";
+  });
+  const setGroupMode = (v: "all" | "gender") => {
+    setGroupModeState(v);
+    try {
+      window.localStorage.setItem(leaderboardGroupKey(eventId), v);
+    } catch {
+      /* localStorage may be unavailable */
+    }
+  };
 
   // Wall-clock instant for the configured frontyard start time (if any).
   const raceStartMs = useMemo(() => {
@@ -215,6 +279,77 @@ export function Leaderboard({ eventId }: { eventId: string }) {
     };
   }, [eventId, raceStartMs, fyLock, fyMax]);
 
+  // Fetch jersey points (Green + Pink) so the leaderboard can show the
+  // per-loop points awarded for the viewed loop. Refreshes alongside the
+  // results refresh cadence.
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | null = null;
+    const REFRESH = 30_000;
+
+    function buildMap(
+      entries: {
+        bib?: string;
+        perLoop?: { loop: number; points?: number; pointsComputed?: number }[];
+      }[],
+      source: "computed" | "api",
+    ): JerseyPointsByBib {
+      const m: JerseyPointsByBib = new Map();
+      for (const e of entries) {
+        const bib = String(e.bib ?? "");
+        if (!bib) continue;
+        const inner = new Map<number, number>();
+        for (const p of e.perLoop ?? []) {
+          let pts: number;
+          if (source === "computed") {
+            // Prefer the locally-computed value (deterministic bib
+            // tie-break on lap time) over RaceResult's published
+            // `points`, which can drop a runner on a tie because
+            // RaceResult uses sub-second chip time we don't have.
+            pts =
+              typeof p.pointsComputed === "number"
+                ? p.pointsComputed
+                : typeof p.points === "number"
+                  ? p.points
+                  : 0;
+          } else {
+            pts = typeof p.points === "number" ? p.points : 0;
+          }
+          if (pts > 0) inner.set(p.loop, pts);
+        }
+        if (inner.size > 0) m.set(bib, inner);
+      }
+      return m;
+    }
+
+    async function load() {
+      try {
+        const res = await fetch(
+          `/api/jerseys?event_id=${encodeURIComponent(eventId)}`,
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (cancelled) return;
+        setGreenByBib(buildMap(data.green ?? [], "computed"));
+        setGreenApiByBib(buildMap(data.green ?? [], "api"));
+        setPinkByBib(buildMap(data.pink ?? [], "api"));
+      } catch {
+        // Non-fatal: leaderboard still renders, points columns show "—".
+      } finally {
+        if (!cancelled) timer = window.setTimeout(load, REFRESH);
+      }
+    }
+
+    setGreenByBib(new Map());
+    setGreenApiByBib(new Map());
+    setPinkByBib(new Map());
+    load();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [eventId]);
+
   const maxLoop = useMemo(() => {
     let m = 0;
     for (const r of rows) {
@@ -228,7 +363,7 @@ export function Leaderboard({ eventId }: { eventId: string }) {
       ? Math.min(Math.max(1, viewLoop), maxLoop)
       : null;
 
-  const sortedRows = useMemo(() => {
+  const derivedRows = useMemo(() => {
     // Lap count comes straight from RaceResult's `NumberOfLaps` field
     // (exposed by the backend as `lapsCompleted`). Last-resort fallback:
     // leader-minus-`lapsBehind`, which only works when the API supplies it.
@@ -291,6 +426,22 @@ export function Leaderboard({ eventId }: { eventId: string }) {
         }
       }
       const accTime = accTimeSec === null ? "" : formatHms(accTimeSec);
+      // Diff is computed per displayed subset in `renderTable` so the
+      // By Gender tables can use their own per-loop fastest as reference.
+      // Green/Pink points for the viewed loop come from /api/jerseys.
+      const pointsLoop = effectiveViewLoop ?? (maxLoop >= 1 ? maxLoop : null);
+      const greenPts =
+        pointsLoop !== null
+          ? greenByBib.get(String(r.bib))?.get(pointsLoop) ?? null
+          : null;
+      const greenApiPts =
+        pointsLoop !== null
+          ? greenApiByBib.get(String(r.bib))?.get(pointsLoop) ?? null
+          : null;
+      const pinkPts =
+        pointsLoop !== null
+          ? pinkByBib.get(String(r.bib))?.get(pointsLoop) ?? null
+          : null;
       return {
         ...r,
         lastLap,
@@ -298,10 +449,169 @@ export function Leaderboard({ eventId }: { eventId: string }) {
         distanceKm: laps === null ? null : laps * loopKm,
         accTime,
         accTimeSec,
+        diff: "",
+        diffSec: null,
+        rankNow: null,
+        greenPts,
+        greenApiPts,
+        pinkPts,
       };
     });
-    return derived.sort((a, b) => compare(a, b, sortKey, sortDir));
-  }, [rows, sortKey, sortDir, mode, effectiveViewLoop]);
+    return derived;
+  }, [rows, mode, effectiveViewLoop, maxLoop, greenByBib, greenApiByBib, pinkByBib]);
+
+  // Identify the current jersey holder per sex for pink/green/yellow, so
+  // the leaderboard can show jersey-color icons next to that runner's name.
+  // Mirrors the logic in Jerseys.tsx: green/pink use accumulated per-loop
+  // points up to min(jerseyCap, snapshotLoop); yellow uses cumulative time
+  // through min(jerseyYellow, snapshotLoop) among runners who completed at
+  // least that loop. In live mode the snapshot follows the race clock
+  // (matches Jerseys.tsx); in replay it follows the playback scrubber.
+  // Race-clock-derived completed-loop count, kept in component state so a
+  // 1Hz interval only triggers a re-render when the value actually changes
+  // (i.e. once per loop boundary, not once per second).
+  const [liveCompletedLoops, setLiveCompletedLoops] = useState(0);
+  useEffect(() => {
+    if (mode !== "frontyard" || raceStartMs === null) {
+      setLiveCompletedLoops(0);
+      return;
+    }
+    const maxLoops = Math.min(FRONTYARD_MAX_CAP, Math.max(1, fyMax));
+    const tick = () => {
+      const elapsedSec = (Date.now() - raceStartMs) / 1000;
+      const lc =
+        elapsedSec < 0
+          ? 0
+          : frontyardState(elapsedSec, fyLock, maxLoops).loopsCompleted;
+      setLiveCompletedLoops((prev) => (prev === lc ? prev : lc));
+    };
+    tick();
+    const timer = window.setInterval(tick, 1_000);
+    return () => window.clearInterval(timer);
+  }, [mode, raceStartMs, fyLock, fyMax]);
+
+  const jerseyHolders = useMemo(() => {
+    const empty: Record<"pink" | "green" | "yellow", { K?: string; M?: string }> = {
+      pink: {},
+      green: {},
+      yellow: {},
+    };
+    // Use the race-clock loop count when live (matches Jerseys.tsx) so the
+    // badges advance the moment a loop boundary passes, independent of the
+    // /api/results poll cadence. In replay, follow the scrubber.
+    const snapshotLoop =
+      effectiveViewLoop ?? (liveCompletedLoops >= 1 ? liveCompletedLoops : null);
+    if (snapshotLoop === null) return empty;
+    const greenCap = Math.min(jerseyGreen || snapshotLoop, snapshotLoop);
+    const pinkCap = Math.min(jerseyPink || snapshotLoop, snapshotLoop);
+    const yellowCap = Math.min(jerseyYellow || snapshotLoop, snapshotLoop);
+
+    // Exact-match sex predicate (matches Jerseys/Dashboard). Anything
+    // other than "M" or "K" is unclassified and excluded.
+    const sexKey = (r: ResultRow): "K" | "M" | null => {
+      if (r.sex === "K") return "K";
+      if (r.sex === "M") return "M";
+      return null;
+    };
+    const sumPoints = (map: JerseyPointsByBib, bib: string, cap: number): number => {
+      const inner = map.get(bib);
+      if (!inner) return 0;
+      let s = 0;
+      for (const [loop, pts] of inner) if (loop <= cap) s += pts;
+      return s;
+    };
+    const pointsAt = (map: JerseyPointsByBib, bib: string, loop: number): number =>
+      map.get(bib)?.get(loop) ?? 0;
+    const lapSecAt = (r: ResultRow, loop: number): number => {
+      const p = (r.perLoop ?? []).find((x) => x.loop === loop);
+      return typeof p?.lapSec === "number" ? p.lapSec : 0;
+    };
+    const accTotalSec = (r: ResultRow, cap: number): number => {
+      const capped = (r.perLoop ?? []).filter((p) => p.loop <= cap);
+      if (capped.length === 0) return 0;
+      const last = capped[capped.length - 1];
+      if (typeof last.totalSec === "number" && last.totalSec > 0) return last.totalSec;
+      return capped.reduce(
+        (acc, p) => acc + (typeof p.lapSec === "number" ? p.lapSec : 0),
+        0,
+      );
+    };
+
+    const result = { pink: {}, green: {}, yellow: {} } as typeof empty;
+    for (const sex of ["K", "M"] as const) {
+      const sexRows = rows.filter((r) => sexKey(r) === sex);
+      // Pick the rank-1 by (total points desc, then points-on-snapshot-loop
+      // desc) -- same tie-break as Jerseys.tsx rankByPoints. Use the API
+      // `points` source (greenApiByBib / pinkByBib) so the holder matches
+      // the Jerseys dashboard exactly.
+      const pickPointsLeader = (
+        map: JerseyPointsByBib,
+        cap: number,
+      ): string | undefined => {
+        let bestBib: string | undefined;
+        let bestTotal = 0;
+        let bestTie = 0;
+        for (const r of sexRows) {
+          const bib = String(r.bib);
+          const total = sumPoints(map, bib, cap);
+          if (total <= 0) continue;
+          const tie = pointsAt(map, bib, cap);
+          if (
+            total > bestTotal ||
+            (total === bestTotal && tie > bestTie)
+          ) {
+            bestTotal = total;
+            bestTie = tie;
+            bestBib = bib;
+          }
+        }
+        return bestBib;
+      };
+      const green = pickPointsLeader(greenApiByBib, greenCap);
+      if (green) result.green[sex] = green;
+      const pink = pickPointsLeader(pinkByBib, pinkCap);
+      if (pink) result.pink[sex] = pink;
+      // yellow: lowest cumulative time through `yellowCap` (which freezes
+      // at jerseyYellow once we've passed it). Tie-break: fastest lap on
+      // that loop.
+      let bestSec = Number.POSITIVE_INFINITY;
+      let bestTie = Number.POSITIVE_INFINITY;
+      let bestBib = "";
+      for (const r of sexRows) {
+        if ((r.lapsCompleted ?? 0) < yellowCap) continue;
+        const sec = accTotalSec(r, yellowCap);
+        if (sec <= 0) continue;
+        const tie = lapSecAt(r, yellowCap);
+        if (sec < bestSec || (sec === bestSec && tie < bestTie)) {
+          bestSec = sec;
+          bestTie = tie;
+          bestBib = String(r.bib);
+        }
+      }
+      if (bestBib) result.yellow[sex] = bestBib;
+    }
+    return result;
+  }, [
+    rows,
+    effectiveViewLoop,
+    liveCompletedLoops,
+    greenApiByBib,
+    pinkByBib,
+    jerseyGreen,
+    jerseyPink,
+    jerseyYellow,
+  ]);
+
+  function jerseysForBib(bib: string): ("pink" | "green" | "yellow")[] {
+    const out: ("pink" | "green" | "yellow")[] = [];
+    const b = String(bib);
+    for (const sex of ["K", "M"] as const) {
+      if (jerseyHolders.pink[sex] === b) out.push("pink");
+      if (jerseyHolders.green[sex] === b) out.push("green");
+      if (jerseyHolders.yellow[sex] === b) out.push("yellow");
+    }
+    return out;
+  }
 
   function toggleSort(key: SortKey) {
     if (key === sortKey) {
@@ -312,11 +622,306 @@ export function Leaderboard({ eventId }: { eventId: string }) {
     }
   }
 
+  function isFemale(r: DerivedRow): boolean {
+    const s = (r.sex || "").trim().toLowerCase();
+    return s === "k" || s === "f" || s === "w" || s === "female" || s === "kvinne";
+  }
+  function isMale(r: DerivedRow): boolean {
+    const s = (r.sex || "").trim().toLowerCase();
+    return s === "m" || s === "male" || s === "mann";
+  }
+
+  function renderTable(
+    rowsToShow: DerivedRow[],
+    colWidths?: string[],
+    visibleRows: number = 20,
+  ) {
+    // Compute Diff against the fastest lapSec *within this subset* for
+    // each loop number, so the By Gender tables use the fastest female
+    // (or male) on that loop as reference -- not the overall fastest.
+    const diffLoop = effectiveViewLoop ?? (maxLoop >= 1 ? maxLoop : null);
+    const withDiff = augmentWithDiff(rowsToShow, diffLoop);
+    const sorted = assignRankLast(withDiff, diffLoop).sort((a, b) =>
+      compare(a, b, sortKey, sortDir),
+    );
+    return (
+      <div
+        className="leaderboard-scroll"
+        style={{
+          width: "100%",
+          // Show `visibleRows` rows (header ~2rem + N * ~1.85rem) and scroll
+          // the rest. Header is sticky so it stays visible while scrolling.
+          maxHeight: `calc(2rem + ${visibleRows} * 1.85rem)`,
+          overflow: "auto",
+        }}
+      >
+        <table
+          style={{
+            borderCollapse: "collapse",
+            width: "max-content",
+            minWidth: "100%",
+            fontSize: "1rem",
+            tableLayout: colWidths ? "fixed" : "auto",
+          }}
+        >
+          {colWidths && (
+            <colgroup>
+              {colWidths.map((w, i) => (
+                <col key={i} style={{ width: w }} />
+              ))}
+            </colgroup>
+          )}
+          {renderHead()}
+          <tbody>{sorted.map((r, i) => renderRow(r, i))}</tbody>
+        </table>
+      </div>
+    );
+  }
+
+  function augmentWithDiff(
+    rowsToShow: DerivedRow[],
+    diffLoop: number | null,
+  ): DerivedRow[] {
+    const fastestLapSecByLoop = new Map<number, number>();
+    for (const r of rowsToShow) {
+      for (const p of r.perLoop ?? []) {
+        if (typeof p.lapSec === "number" && p.lapSec > 0) {
+          const cur = fastestLapSecByLoop.get(p.loop);
+          if (cur === undefined || p.lapSec < cur) {
+            fastestLapSecByLoop.set(p.loop, p.lapSec);
+          }
+        }
+      }
+    }
+    return rowsToShow.map((r) => {
+      let diffSec: number | null = null;
+      let diff = "";
+      if (diffLoop !== null) {
+        const own = r.perLoop?.find((p) => p.loop === diffLoop);
+        const ownSec = typeof own?.lapSec === "number" ? own.lapSec : null;
+        const fastestSec = fastestLapSecByLoop.get(diffLoop) ?? null;
+        if (ownSec !== null && fastestSec !== null) {
+          const d = ownSec - fastestSec;
+          diffSec = d;
+          if (d === 0) {
+            diff = "—";
+          } else {
+            const sign = d > 0 ? "+" : "−";
+            const abs = Math.abs(d);
+            const mm = Math.floor(abs / 60);
+            const ss = Math.floor(abs % 60);
+            diff = `${sign}${mm}:${ss.toString().padStart(2, "0")}`;
+          }
+        }
+      }
+      return { ...r, diff, diffSec };
+    });
+  }
+
+  function assignRankLast(
+    rowsIn: DerivedRow[],
+    diffLoop: number | null,
+  ): DerivedRow[] {
+    // Rank Last = position when sorting the subset by the lap time of
+    // `diffLoop` ascending. Rows missing a lap time for that loop get
+    // no rank.
+    if (diffLoop === null) {
+      return rowsIn.map((r) => ({ ...r, rankNow: null }));
+    }
+    const withSec = rowsIn.map((r, idx) => {
+      const own = r.perLoop?.find((p) => p.loop === diffLoop);
+      const sec =
+        typeof own?.lapSec === "number" && own.lapSec > 0 ? own.lapSec : null;
+      return { r, idx, sec };
+    });
+    const ranked = withSec
+      .filter((x) => x.sec !== null)
+      .sort((a, b) => (a.sec as number) - (b.sec as number) || a.idx - b.idx);
+    const rankByIdx = new Map<number, number>();
+    ranked.forEach((x, i) => rankByIdx.set(x.idx, i + 1));
+    return rowsIn.map((r, idx) => ({
+      ...r,
+      rankNow: rankByIdx.get(idx) ?? null,
+    }));
+  }
+
+  function renderHead() {
+    return (
+      <thead>
+        <tr style={{ background: "#f3f3f3" }}>
+          {visibleColumns.map((col) => {
+            const active = col.key === sortKey;
+            const arrow = active ? (sortDir === "asc" ? " ▲" : " ▼") : "";
+            return (
+              <th
+                key={col.key}
+                onClick={() => toggleSort(col.key)}
+                style={{
+                  ...th,
+                  cursor: "pointer",
+                  textAlign: col.numeric ? "right" : "left",
+                  userSelect: "none",
+                  whiteSpace: "nowrap",
+                }}
+                title="Click to sort"
+              >
+                {col.label}
+                <span style={{ color: "#888" }}>{arrow}</span>
+              </th>
+            );
+          })}
+        </tr>
+      </thead>
+    );
+  }
+
+  function renderRow(r: DerivedRow, i: number) {
+    return (
+      <tr
+        key={`${r.bib}-${i}`}
+        style={i % 2 ? { background: "#fafafa" } : undefined}
+      >
+        <td style={tdNum}>{r.bib}</td>
+        <td style={td}>
+          {r.name}
+          {mode === "frontyard" && (
+            <JerseyBadges jerseys={jerseysForBib(r.bib)} />
+          )}
+        </td>
+        <td style={td}>{r.total || "—"}</td>
+        <td style={tdNum}>{r.totalRank ?? "—"}</td>
+        {!hiddenCols.has("gap") && <td style={td}>{r.gap || "—"}</td>}
+        <td style={td}>{r.club}</td>
+        <td style={td}>
+          {countryAlpha2(r.country) ? (
+            <img
+              src={`https://flagcdn.com/${countryAlpha2(r.country)}.svg`}
+              width={24}
+              height={18}
+              alt={r.country}
+              title={r.country}
+              style={{ verticalAlign: "middle", borderRadius: 2 }}
+            />
+          ) : (
+            r.country
+          )}
+        </td>
+        <td style={td}>{r.sex}</td>
+        <td style={tdNum}>{r.laps ?? "—"}</td>
+        <td style={td}>{r.lastLap || "—"}</td>
+        {!hiddenCols.has("rankNow") && (
+          <td style={tdNum}>{r.rankNow ?? "—"}</td>
+        )}
+        {!hiddenCols.has("greenPts") && (
+          <td
+            style={
+              r.greenPts !== r.greenApiPts
+                ? { ...tdNum, background: "#fef9c3" }
+                : tdNum
+            }
+          >
+            {r.greenPts ?? "—"}
+          </td>
+        )}
+        {!hiddenCols.has("greenApiPts") && (
+          <td
+            style={
+              r.greenPts !== r.greenApiPts
+                ? { ...tdNum, background: "#fef9c3" }
+                : tdNum
+            }
+          >
+            {r.greenApiPts ?? "—"}
+          </td>
+        )}
+        {!hiddenCols.has("pinkPts") && (
+          <td style={tdNum}>{r.pinkPts ?? "—"}</td>
+        )}
+        {!hiddenCols.has("diffSec") && (
+          <td style={tdNum}>{r.diff || "—"}</td>
+        )}
+        <td style={td}>{r.fastestLap || "—"}</td>
+        <td style={td}>{r.slowestLap || "—"}</td>
+        <td style={td}>{r.averageLap || "—"}</td>
+        <td style={tdNum}>{r.accTime || "—"}</td>
+        <td style={td}>
+          {r.distanceKm === null ? "—" : `${r.distanceKm.toFixed(1)} km`}
+        </td>
+        <td style={td}>{r.status || "—"}</td>
+      </tr>
+    );
+  }
+
+  function computeColWidths(rows: DerivedRow[]): string[] {
+    // Build per-column widths from the longest content across the given
+    // rows (plus the header label) so two separate tables can be locked
+    // to identical widths with `table-layout: fixed`.
+    return visibleColumns.map((col) => {
+      // Country renders a 24px flag image, not text -- give it a fixed slot.
+      if (col.key === "country") return "3.5rem";
+      // Header label with a little room for the sort arrow.
+      let maxLen = col.label.length + 2;
+      for (const r of rows) {
+        const v = r[col.key];
+        const text =
+          v === null || v === undefined
+            ? "—"
+            : col.key === "distanceKm" && typeof v === "number"
+              ? `${v.toFixed(1)} km`
+              : String(v);
+        if (text.length > maxLen) maxLen = text.length;
+      }
+      // The name cell may also render up to 3 jersey badges (frontyard only).
+      // Each badge is ~1.1rem wide with a small gap; reserve ~3ch per badge
+      // plus a small left margin so both gender tables agree on width.
+      if (col.key === "name" && mode === "frontyard") {
+        let maxBadges = 0;
+        for (const r of rows) {
+          const n = jerseysForBib(r.bib).length;
+          if (n > maxBadges) maxBadges = n;
+        }
+        if (maxBadges > 0) maxLen += 1 + maxBadges * 3;
+      }
+      // 1ch ≈ width of "0". Add padding for cell padding (~1.5ch).
+      return `${maxLen + 2}ch`;
+    });
+  }
+
+  function renderGenderTables() {
+    const colWidths = computeColWidths([...femaleRows, ...maleRows]);
+    return (
+      <>
+        <h3 style={{ margin: "0.5rem 0 0", alignSelf: "flex-start" }}>
+          Female ({femaleRows.length})
+        </h3>
+        {femaleRows.length > 0 ? (
+          renderTable(femaleRows, colWidths, 10)
+        ) : (
+          <p style={{ color: "#888", margin: 0 }}>No entries</p>
+        )}
+        <h3 style={{ margin: "0.5rem 0 0", alignSelf: "flex-start" }}>
+          Male ({maleRows.length})
+        </h3>
+        {maleRows.length > 0 ? (
+          renderTable(maleRows, colWidths, 10)
+        ) : (
+          <p style={{ color: "#888", margin: 0 }}>No entries</p>
+        )}
+      </>
+    );
+  }
+
+  const femaleRows = derivedRows.filter(isFemale);
+  const maleRows = derivedRows.filter(isMale);
+  // `derivedRows` is the unsorted set of rows for the current view loop
+  // (in-place sorting happens inside `renderTable` so each subset can
+  // compute its own Diff column).
+
   return (
     <section
       style={{
         width: "100%",
-        maxWidth: "1800px",
+        maxWidth: "2100px",
         margin: "0 auto",
         display: "flex",
         flexDirection: "column",
@@ -333,6 +938,27 @@ export function Leaderboard({ eventId }: { eventId: string }) {
       {loading && rows.length === 0 && <p>Loading…</p>}
       {maxLoop >= 1 && (
         <div
+          role="group"
+          aria-label="Replay controls"
+          tabIndex={-1}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowLeft") {
+              e.preventDefault();
+              setViewLoop(Math.max(1, (effectiveViewLoop ?? maxLoop) - 1));
+            } else if (e.key === "ArrowRight") {
+              e.preventDefault();
+              setViewLoop(Math.min(maxLoop, (effectiveViewLoop ?? 0) + 1));
+            } else if (e.key === "Home") {
+              e.preventDefault();
+              setViewLoop(1);
+            } else if (e.key === "End") {
+              e.preventDefault();
+              setViewLoop(maxLoop);
+            } else if (e.key.toLowerCase() === "l") {
+              e.preventDefault();
+              setViewLoop(null);
+            }
+          }}
           style={{
             display: "flex",
             alignItems: "center",
@@ -364,7 +990,7 @@ export function Leaderboard({ eventId }: { eventId: string }) {
           </button>
           <span style={{ minWidth: "9rem", textAlign: "center" }}>
             {effectiveViewLoop !== null
-              ? `Loop ${effectiveViewLoop} / ${maxLoop} (${sortedRows.length})`
+              ? `Loop ${effectiveViewLoop} / ${maxLoop} (${derivedRows.length})`
               : `Live · loop ${maxLoop}`}
           </span>
           <button
@@ -402,97 +1028,39 @@ export function Leaderboard({ eventId }: { eventId: string }) {
       )}
       {error && <p style={{ color: "crimson" }}>Error: {error}</p>}
 
-      {sortedRows.length > 0 && (
+      {derivedRows.length > 0 && (
         <div
-          className="leaderboard-scroll"
           style={{
-            width: "100%",
-            maxHeight: "calc(100vh - 20rem)",
-            overflow: "scroll",
+            display: "flex",
+            alignItems: "center",
+            gap: "0.5rem",
+            alignSelf: "flex-start",
           }}
         >
-        <table
-          style={{
-            borderCollapse: "collapse",
-            width: "max-content",
-            minWidth: "100%",
-            fontSize: "1rem",
-          }}
-        >
-          <thead>
-            <tr style={{ background: "#f3f3f3" }}>
-              {columns.map((col) => {
-                const active = col.key === sortKey;
-                const arrow = active ? (sortDir === "asc" ? " ▲" : " ▼") : "";
-                return (
-                  <th
-                    key={col.key}
-                    onClick={() => toggleSort(col.key)}
-                    style={{
-                      ...th,
-                      cursor: "pointer",
-                      textAlign: col.numeric ? "right" : "left",
-                      userSelect: "none",
-                      whiteSpace: "nowrap",
-                    }}
-                    title="Click to sort"
-                  >
-                    {col.label}
-                    <span style={{ color: "#888" }}>{arrow}</span>
-                  </th>
-                );
-              })}
-            </tr>
-          </thead>
-          <tbody>
-            {sortedRows.map((r, i) => (
-              <tr
-                key={`${r.bib}-${i}`}
-                style={i % 2 ? { background: "#fafafa" } : undefined}
-              >
-                <td style={tdNum}>{r.totalRank ?? "—"}</td>
-                <td style={tdNum}>{r.bib}</td>
-                <td style={td}>{r.name}</td>
-                <td style={td}>{r.club}</td>
-                <td style={td}>
-                  {countryAlpha2(r.country) ? (
-                    <img
-                      src={`https://flagcdn.com/${countryAlpha2(r.country)}.svg`}
-                      width={24}
-                      height={18}
-                      alt={r.country}
-                      title={r.country}
-                      style={{ verticalAlign: "middle", borderRadius: 2 }}
-                    />
-                  ) : (
-                    r.country
-                  )}
-                </td>
-                <td style={td}>{r.sex}</td>
-                <td style={tdNum}>{r.laps ?? "—"}</td>
-                <td style={td}>{r.gap || "—"}</td>
-                <td style={td}>{r.lastLap || "—"}</td>
-                <td style={td}>{r.fastestLap || "—"}</td>
-                <td style={td}>{r.slowestLap || "—"}</td>
-                <td style={td}>{r.averageLap || "—"}</td>
-                <td style={td}>{r.total || "—"}</td>
-                <td style={tdNum}>{r.accTime || "—"}</td>
-                <td style={td}>
-                  {r.distanceKm === null ? "—" : `${r.distanceKm.toFixed(1)} km`}
-                </td>
-                <td style={td}>{r.status || "—"}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+          <label htmlFor="leaderboard-group" style={{ fontSize: "0.9rem" }}>
+            Show:
+          </label>
+          <select
+            id="leaderboard-group"
+            value={groupMode}
+            onChange={(e) => setGroupMode(e.target.value as "all" | "gender")}
+            style={{ padding: "0.25rem 0.5rem" }}
+          >
+            <option value="all">All</option>
+            <option value="gender">By Gender</option>
+          </select>
         </div>
       )}
+
+      {derivedRows.length > 0 && groupMode === "all" && renderTable(derivedRows)}
+
+      {derivedRows.length > 0 && groupMode === "gender" && renderGenderTables()}
 
       {lastUpdated && (
         <p style={{ margin: 0, color: "#888", fontSize: "0.85rem" }}>
           {raceFinished
-            ? `Final results · ${sortedRows.length} entries`
-            : `Updated ${lastUpdated.toLocaleTimeString()} · auto-refresh every ${REFRESH_MS / 1000}s · ${sortedRows.length} entries`}
+            ? `Final results · ${derivedRows.length} entries`
+            : `Updated ${lastUpdated.toLocaleTimeString()} · auto-refresh every ${REFRESH_MS / 1000}s · ${derivedRows.length} entries`}
         </p>
       )}
     </section>
@@ -502,6 +1070,10 @@ export function Leaderboard({ eventId }: { eventId: string }) {
 const th: React.CSSProperties = {
   padding: "0.5rem 0.75rem",
   borderBottom: "2px solid #ddd",
+  position: "sticky",
+  top: 0,
+  background: "#f3f3f3",
+  zIndex: 1,
 };
 const td: React.CSSProperties = {
   padding: "0.4rem 0.75rem",
@@ -515,3 +1087,53 @@ const tdNum: React.CSSProperties = {
   textAlign: "right",
   width: "4rem",
 };
+
+const JERSEY_BG: Record<"pink" | "green" | "yellow", string> = {
+  pink: "#ec4899",
+  green: "#16a34a",
+  yellow: "#eab308",
+};
+const JERSEY_FG: Record<"pink" | "green" | "yellow", string> = {
+  pink: "white",
+  green: "white",
+  yellow: "#3f2c00",
+};
+const JERSEY_LETTER: Record<"pink" | "green" | "yellow", string> = {
+  pink: "P",
+  green: "G",
+  yellow: "Y",
+};
+
+function JerseyBadges({
+  jerseys,
+}: {
+  jerseys: ("pink" | "green" | "yellow")[];
+}) {
+  if (!jerseys || jerseys.length === 0) return null;
+  return (
+    <span style={{ display: "inline-flex", gap: "0.2rem", marginLeft: "0.4rem" }}>
+      {jerseys.map((j) => (
+        <span
+          key={j}
+          title={`Current ${j} jersey holder`}
+          aria-label={`${j} jersey`}
+          style={{
+            display: "inline-block",
+            minWidth: "1.1rem",
+            padding: "0 0.35rem",
+            borderRadius: "0.65rem",
+            background: JERSEY_BG[j],
+            color: JERSEY_FG[j],
+            fontSize: "0.72rem",
+            fontWeight: 700,
+            textAlign: "center",
+            lineHeight: "1.1rem",
+            border: "1px solid rgba(0,0,0,0.1)",
+          }}
+        >
+          {JERSEY_LETTER[j]}
+        </span>
+      ))}
+    </span>
+  );
+}

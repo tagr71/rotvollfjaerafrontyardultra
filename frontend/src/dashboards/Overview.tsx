@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BACKYARD_LOOP_KM,
   FRONTYARD_LOOP_KM,
+  playbackBtn,
   useTimerSettings,
   useViewLoop,
 } from "./timerCore";
@@ -166,6 +167,27 @@ export function Overview({ eventId }: { eventId: string }) {
       <h1 style={{ margin: 0 }}>Overview</h1>
       {maxLoop >= 1 && (
         <div
+          role="group"
+          aria-label="Replay controls"
+          tabIndex={-1}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowLeft") {
+              e.preventDefault();
+              setViewLoop(Math.max(1, (effectiveViewLoop ?? maxLoop) - 1));
+            } else if (e.key === "ArrowRight") {
+              e.preventDefault();
+              setViewLoop(Math.min(maxLoop, (effectiveViewLoop ?? 0) + 1));
+            } else if (e.key === "Home") {
+              e.preventDefault();
+              setViewLoop(1);
+            } else if (e.key === "End") {
+              e.preventDefault();
+              setViewLoop(maxLoop);
+            } else if (e.key.toLowerCase() === "l") {
+              e.preventDefault();
+              setViewLoop(null);
+            }
+          }}
           style={{
             display: "flex",
             alignItems: "center",
@@ -355,15 +377,6 @@ const statGridBottom: React.CSSProperties = {
   gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
   gap: "1rem",
   width: "100%",
-};
-
-const playbackBtn: React.CSSProperties = {
-  padding: "0.3rem 0.6rem",
-  fontSize: "1rem",
-  border: "1px solid #ccc",
-  borderRadius: "0.3rem",
-  background: "white",
-  cursor: "pointer",
 };
 
 const statCard: React.CSSProperties = {

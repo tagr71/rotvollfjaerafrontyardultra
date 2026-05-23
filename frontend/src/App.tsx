@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { dashboards } from "./dashboards";
+import { modeKey } from "./dashboards/timerCore";
 
 const EVENT_ID_KEY = "raceresult.eventId";
 const DASHBOARD_KEY = "raceresult.dashboard";
@@ -13,6 +14,23 @@ const PREDEFINED_EVENTS: { id: string; label: string }[] = [
   { id: "400116", label: "Frontyard Test" },
 ];
 const OTHER_OPTION = "__other__";
+
+/** Decide whether the given event is a "backyard" race. Resolution order:
+ * 1. Stored Timer-setup mode for this event (set in Settings or auto-
+ *    detected from `/api/results` eventMode).
+ * 2. Heuristic on the predefined-event label (contains "backyard" /
+ *    "frontyard").
+ * 3. Default: false — leaves the Jerseys dashboard visible until the
+ *    user opens Settings (which auto-detects and stores the mode). */
+function isBackyardEvent(id: string, label: string): boolean {
+  const stored = id ? localStorage.getItem(modeKey(id)) : null;
+  if (stored === "backyard") return true;
+  if (stored === "frontyard") return false;
+  const lc = label.toLowerCase();
+  if (lc.includes("backyard")) return true;
+  if (lc.includes("frontyard")) return false;
+  return false;
+}
 
 type Selection = { eventId: string; dashboardId: string };
 
@@ -87,6 +105,25 @@ export function App() {
   function onBack() {
     setSelection(null);
   }
+
+  // Filter the Dashboard dropdown: Jerseys is frontyard-only.
+  const currentLabel =
+    PREDEFINED_EVENTS.find((e) => e.id === eventId)?.label ?? "";
+  const visibleDashboards = useMemo(
+    () =>
+      isBackyardEvent(eventId, currentLabel)
+        ? dashboards.filter((d) => d.id !== "jerseys")
+        : dashboards,
+    [eventId, currentLabel],
+  );
+  // Reset to the first visible dashboard if the persisted selection is
+  // no longer available (e.g. user switched a "jerseys" pick to a
+  // backyard event).
+  useEffect(() => {
+    if (!visibleDashboards.some((d) => d.id === dashboardId)) {
+      setDashboardId(visibleDashboards[0]?.id ?? dashboards[0].id);
+    }
+  }, [visibleDashboards, dashboardId]);
 
   const active = selection
     ? dashboards.find((d) => d.id === selection.dashboardId)
@@ -219,7 +256,7 @@ export function App() {
                 onChange={(e) => setDashboardId(e.target.value)}
                 style={{ padding: "0.4rem 0.6rem", fontSize: "1rem" }}
               >
-                {dashboards.map((d) => (
+                {visibleDashboards.map((d) => (
                   <option key={d.id} value={d.id}>
                     {d.title}
                   </option>
@@ -236,7 +273,7 @@ export function App() {
                 cursor: eventId.trim() ? "pointer" : "not-allowed",
               }}
             >
-              {`Open ${dashboards.find((d) => d.id === dashboardId)?.title ?? "dashboard"}`}
+              {`Open ${visibleDashboards.find((d) => d.id === dashboardId)?.title ?? "dashboard"}`}
             </button>
           </form>
         )}

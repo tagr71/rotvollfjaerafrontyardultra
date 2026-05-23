@@ -1,0 +1,38 @@
+# Build artefacts and local-only state — never ship them into the image.
+
+# Git metadata
+.git
+.gitignore
+.github
+
+# Node
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# Python
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Editor / OS
+.vscode
+.idea
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local secrets / env (the runtime user passes these via --env-file / --env)
+backend/.env
+.env
+.env.*
+
+# Docs / misc
+README.md
+*.md

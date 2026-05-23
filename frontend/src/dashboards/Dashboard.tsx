@@ -7,6 +7,7 @@ import {
   NowOsloRow,
   StatCard,
   formatDuration,
+  formatHms,
   formatKm,
   formatOslo,
   frontyardElapsedAtLoopStart,
@@ -102,7 +103,13 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
     total?: string;
     totalSec?: number;
     lapsCompleted?: number;
-    perLoop?: { loop: number; points?: number }[];
+    perLoop?: {
+      loop: number;
+      points?: number;
+      time?: string;
+      lapSec?: number;
+      totalSec?: number;
+    }[];
   };
   type JerseysFetchPayload = {
     green: HolderEntry[];
@@ -203,7 +210,7 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
   /** Top 3 holders per sex for each jersey, capped at the configured
    * jersey end-loop and the snapshot loop (live timer or replay). */
   const jerseyHolders = useMemo(() => {
-    type Holder = { name: string; value: string };
+    type Holder = { bib: string; name: string; value: string };
     const result = {
       pink: { K: [] as Holder[], M: [] as Holder[] },
       green: { K: [] as Holder[], M: [] as Holder[] },
@@ -224,36 +231,81 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
       (e.perLoop ?? [])
         .filter((p) => p.loop <= cap)
         .reduce((acc, p) => acc + (p.points ?? 0), 0);
+    // Points scored on exactly `loop` (tie-break for green/pink).
+    const pointsAtLoop = (e: HolderEntry, loop: number): number =>
+      (e.perLoop ?? []).find((p) => p.loop === loop)?.points ?? 0;
+    // Lap time on exactly `loop` (tie-break for yellow).
+    const lapSecAtLoop = (e: HolderEntry, loop: number): number =>
+      (e.perLoop ?? []).find((p) => p.loop === loop)?.lapSec ?? 0;
+    // Cumulative race time from loop 1 through `cap`. Prefers the per-loop
+    // cumulative `totalSec`; falls back to summing `lapSec`; finally to the
+    // entry-level `totalSec` when no per-loop data is available.
+    const accTimeUpto = (e: HolderEntry, cap: number): number => {
+      const capped = (e.perLoop ?? []).filter((p) => p.loop <= cap);
+      if (capped.length > 0) {
+        const last = capped[capped.length - 1];
+        if (typeof last.totalSec === "number" && last.totalSec > 0) {
+          return last.totalSec;
+        }
+        const sum = capped.reduce(
+          (acc, p) => acc + (typeof p.lapSec === "number" ? p.lapSec : 0),
+          0,
+        );
+        if (sum > 0) return sum;
+      }
+      return e.totalSec ?? 0;
+    };
     const pinkCap = Math.min(jerseyPink, holderSnapshotLoop);
     const greenCap = Math.min(jerseyGreen, holderSnapshotLoop);
+    // Yellow freezes at jerseyYellow once the snapshot passes that loop,
+    // so the holder stops changing for the remainder of the race.
+    const yellowCap = Math.min(jerseyYellow, holderSnapshotLoop);
     for (const sex of ["K", "M"] as const) {
       result.pink[sex] = jerseyData.pink
         .filter((e) => resolveSex(e) === sex)
         .map((e) => ({ e, pts: sumUpto(e, pinkCap) }))
         .filter((x) => x.pts > 0)
-        .sort((a, b) => b.pts - a.pts)
+        .sort((a, b) => {
+          if (b.pts !== a.pts) return b.pts - a.pts;
+          // Tie: most points on the snapshot loop (API points).
+          return pointsAtLoop(b.e, pinkCap) - pointsAtLoop(a.e, pinkCap);
+        })
         .slice(0, 3)
-        .map((x) => ({ name: x.e.name, value: `${x.pts} p` }));
+        .map((x) => ({ bib: x.e.bib, name: x.e.name, value: `${x.pts} p` }));
       result.green[sex] = jerseyData.green
         .filter((e) => resolveSex(e) === sex)
         .map((e) => ({ e, pts: sumUpto(e, greenCap) }))
         .filter((x) => x.pts > 0)
-        .sort((a, b) => b.pts - a.pts)
+        .sort((a, b) => {
+          if (b.pts !== a.pts) return b.pts - a.pts;
+          // Tie: most points on the snapshot loop (API points).
+          return pointsAtLoop(b.e, greenCap) - pointsAtLoop(a.e, greenCap);
+        })
         .slice(0, 3)
-        .map((x) => ({ name: x.e.name, value: `${x.pts} p` }));
+        .map((x) => ({ bib: x.e.bib, name: x.e.name, value: `${x.pts} p` }));
       result.yellow[sex] = jerseyData.yellow
         .filter((e) => {
           if (resolveSex(e) !== sex) return false;
-          if ((e.totalSec ?? 0) <= 0) return false;
           const lc = typeof e.lapsCompleted === "number" ? e.lapsCompleted : 0;
-          return lc >= holderSnapshotLoop;
+          if (lc < yellowCap) return false;
+          return accTimeUpto(e, yellowCap) > 0;
         })
-        .sort((a, b) => (a.totalSec ?? 0) - (b.totalSec ?? 0))
+        .sort((a, b) => {
+          const ta = accTimeUpto(a, yellowCap);
+          const tb = accTimeUpto(b, yellowCap);
+          if (ta !== tb) return ta - tb;
+          // Tie: faster lap on the snapshot loop wins.
+          return lapSecAtLoop(a, yellowCap) - lapSecAtLoop(b, yellowCap);
+        })
         .slice(0, 3)
-        .map((e) => ({ name: e.name, value: e.total ?? "—" }));
+        .map((e) => ({
+          bib: e.bib,
+          name: e.name,
+          value: formatHms(accTimeUpto(e, yellowCap)),
+        }));
     }
     return result;
-  }, [jerseyData, holderSnapshotLoop, jerseyPink, jerseyGreen]);
+  }, [jerseyData, holderSnapshotLoop, jerseyPink, jerseyGreen, jerseyYellow]);
 
   // Derive the runners-this-loop / completed-past-loop counters. The
   // detailed semantics are documented inline below; in short:
@@ -371,10 +423,14 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
       <>
         {cards.map((c) => {
           const h = jerseyHolders[c.key];
+          const frozen =
+            c.endsAt > 0 && holderSnapshotLoop > c.endsAt;
           const subtitle =
-            holderSnapshotLoop >= 1
-              ? `after ${Math.min(holderSnapshotLoop, c.endsAt)} of ${c.endsAt} loops`
-              : `no loops completed yet (of ${c.endsAt})`;
+            holderSnapshotLoop < 1
+              ? `no loops completed yet (of ${c.endsAt})`
+              : frozen
+                ? `frozen at loop ${c.endsAt}`
+                : `after ${Math.min(holderSnapshotLoop, c.endsAt)} of ${c.endsAt} loops`;
           return (
             <div
               key={c.key}
@@ -449,6 +505,19 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
                             }}
                           >
                             {i + 1}.
+                          </span>
+                          <span
+                            style={{
+                              color: "#555",
+                              fontWeight: 600,
+                              fontSize: "0.85rem",
+                              fontVariantNumeric: "tabular-nums",
+                              minWidth: "2.2rem",
+                              textAlign: "right",
+                            }}
+                            title="Bib"
+                          >
+                            {holder?.bib ?? "—"}
                           </span>
                           <span
                             style={{
@@ -565,6 +634,27 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
 
       {replayAvailable && (
         <div
+          role="group"
+          aria-label="Replay controls"
+          tabIndex={-1}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowLeft") {
+              e.preventDefault();
+              setViewLoop(Math.max(1, (effectiveViewLoop ?? maxLoop) - 1));
+            } else if (e.key === "ArrowRight") {
+              e.preventDefault();
+              setViewLoop(Math.min(maxLoop, (effectiveViewLoop ?? 0) + 1));
+            } else if (e.key === "Home") {
+              e.preventDefault();
+              setViewLoop(1);
+            } else if (e.key === "End") {
+              e.preventDefault();
+              setViewLoop(maxLoop);
+            } else if (e.key.toLowerCase() === "l") {
+              e.preventDefault();
+              setViewLoop(null);
+            }
+          }}
           style={{
             display: "flex",
             alignItems: "center",
@@ -583,6 +673,7 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
             onClick={() => setViewLoop(1)}
             disabled={inReplay && effectiveViewLoop === 1}
             title="First loop"
+            aria-label="Jump to first loop"
             style={playbackBtn}
           >
             ⏮
@@ -594,6 +685,7 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
             }
             disabled={inReplay && effectiveViewLoop === 1}
             title="Previous loop"
+            aria-label="Previous loop"
             style={playbackBtn}
           >
             ◀
@@ -608,6 +700,7 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
             }
             disabled={inReplay && effectiveViewLoop === maxLoop}
             title="Next loop"
+            aria-label="Next loop"
             style={playbackBtn}
           >
             ▶
@@ -617,6 +710,7 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
             onClick={() => setViewLoop(maxLoop)}
             disabled={inReplay && effectiveViewLoop === maxLoop}
             title="Last loop"
+            aria-label="Jump to last loop"
             style={playbackBtn}
           >
             ⏭
@@ -626,6 +720,7 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
             onClick={() => setViewLoop(null)}
             disabled={!inReplay}
             title="Live"
+            aria-label="Resume live mode"
             style={{
               ...playbackBtn,
               marginLeft: "0.5rem",
