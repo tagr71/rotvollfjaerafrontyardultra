@@ -166,6 +166,27 @@ export function Overview({ eventId }: { eventId: string }) {
       <h1 style={{ margin: 0 }}>Overview</h1>
       {maxLoop >= 1 && (
         <div
+          role="group"
+          aria-label="Replay controls"
+          tabIndex={-1}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowLeft") {
+              e.preventDefault();
+              setViewLoop(Math.max(1, (effectiveViewLoop ?? maxLoop) - 1));
+            } else if (e.key === "ArrowRight") {
+              e.preventDefault();
+              setViewLoop(Math.min(maxLoop, (effectiveViewLoop ?? 0) + 1));
+            } else if (e.key === "Home") {
+              e.preventDefault();
+              setViewLoop(1);
+            } else if (e.key === "End") {
+              e.preventDefault();
+              setViewLoop(maxLoop);
+            } else if (e.key.toLowerCase() === "l") {
+              e.preventDefault();
+              setViewLoop(null);
+            }
+          }}
           style={{
             display: "flex",
             alignItems: "center",
