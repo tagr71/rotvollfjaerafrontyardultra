@@ -861,9 +861,9 @@ export function Leaderboard({ eventId }: { eventId: string }) {
 
   const femaleRows = derivedRows.filter(isFemale);
   const maleRows = derivedRows.filter(isMale);
-  // Used only for counts/conditional rendering; per-table sorting now
-  // happens inside `renderTable` so each subset can compute its own Diff.
-  const sortedRows = derivedRows;
+  // `derivedRows` is the unsorted set of rows for the current view loop
+  // (in-place sorting happens inside `renderTable` so each subset can
+  // compute its own Diff column).
 
   return (
     <section
@@ -938,7 +938,7 @@ export function Leaderboard({ eventId }: { eventId: string }) {
           </button>
           <span style={{ minWidth: "9rem", textAlign: "center" }}>
             {effectiveViewLoop !== null
-              ? `Loop ${effectiveViewLoop} / ${maxLoop} (${sortedRows.length})`
+              ? `Loop ${effectiveViewLoop} / ${maxLoop} (${derivedRows.length})`
               : `Live · loop ${maxLoop}`}
           </span>
           <button
@@ -976,7 +976,7 @@ export function Leaderboard({ eventId }: { eventId: string }) {
       )}
       {error && <p style={{ color: "crimson" }}>Error: {error}</p>}
 
-      {sortedRows.length > 0 && (
+      {derivedRows.length > 0 && (
         <div
           style={{
             display: "flex",
@@ -1000,15 +1000,15 @@ export function Leaderboard({ eventId }: { eventId: string }) {
         </div>
       )}
 
-      {sortedRows.length > 0 && groupMode === "all" && renderTable(sortedRows)}
+      {derivedRows.length > 0 && groupMode === "all" && renderTable(derivedRows)}
 
-      {sortedRows.length > 0 && groupMode === "gender" && renderGenderTables()}
+      {derivedRows.length > 0 && groupMode === "gender" && renderGenderTables()}
 
       {lastUpdated && (
         <p style={{ margin: 0, color: "#888", fontSize: "0.85rem" }}>
           {raceFinished
-            ? `Final results · ${sortedRows.length} entries`
-            : `Updated ${lastUpdated.toLocaleTimeString()} · auto-refresh every ${REFRESH_MS / 1000}s · ${sortedRows.length} entries`}
+            ? `Final results · ${derivedRows.length} entries`
+            : `Updated ${lastUpdated.toLocaleTimeString()} · auto-refresh every ${REFRESH_MS / 1000}s · ${derivedRows.length} entries`}
         </p>
       )}
     </section>

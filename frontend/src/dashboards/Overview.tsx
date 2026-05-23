@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BACKYARD_LOOP_KM,
   FRONTYARD_LOOP_KM,
+  playbackBtn,
   useTimerSettings,
   useViewLoop,
 } from "./timerCore";
@@ -376,15 +377,6 @@ const statGridBottom: React.CSSProperties = {
   gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
   gap: "1rem",
   width: "100%",
-};
-
-const playbackBtn: React.CSSProperties = {
-  padding: "0.3rem 0.6rem",
-  fontSize: "1rem",
-  border: "1px solid #ccc",
-  borderRadius: "0.3rem",
-  background: "white",
-  cursor: "pointer",
 };
 
 const statCard: React.CSSProperties = {
