@@ -27,6 +27,7 @@
  */
 
 import {
+  computeJerseyStatus,
   rankByPoints,
   rankYellow,
   type DisplayRow,
@@ -198,6 +199,17 @@ function main(): void {
           `\n  [${JERSEY_LABEL[jersey]}] ${SEX_LABEL[sex]}\n`,
         );
         process.stdout.write(fmtTable(rows, opts.top) + "\n");
+        const endsAt = opts.numLoops;
+        const status = computeJerseyStatus(rows, jersey, endsAt, cap, false);
+        if (status) {
+          const label =
+            status === "decided"
+              ? "✓ DECIDED"
+              : status === "likely"
+                ? "~ LIKELY"
+                : "★ FINISHED";
+          process.stdout.write(`  status: ${label}\n`);
+        }
 
         const currentHolder = rows[0]?.bib;
         const k = keyOf(jersey, sex);

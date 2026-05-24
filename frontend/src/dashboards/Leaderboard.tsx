@@ -12,6 +12,13 @@ import {
   useTimerSettings,
   useViewLoop,
 } from "./timerCore";
+import {
+  buildSexLookup,
+  computeWinner,
+  isRaceOver,
+  type JerseyEntry,
+  type WinnerRow,
+} from "./jerseyRanking";
 
 type ResultRow = {
   place: number | null;
@@ -613,6 +620,304 @@ export function Leaderboard({ eventId }: { eventId: string }) {
     return out;
   }
 
+  // For each jersey, count how many loops every runner has been the
+  // rank-1 holder up to the snapshot loop (capped at each jersey's
+  // configured end loop). Used by the inline badges next to the
+  // runner's name so the pill shows the loops-held count instead of
+  // the redundant P/G/Y letter.
+  const heldCountsByJersey = useMemo(() => {
+    const empty: Record<
+      "pink" | "green" | "yellow",
+      Record<"K" | "M", Map<string, number>>
+    > = {
+      pink: { K: new Map(), M: new Map() },
+      green: { K: new Map(), M: new Map() },
+      yellow: { K: new Map(), M: new Map() },
+    };
+    const snapshotLoop =
+      effectiveViewLoop ?? (liveCompletedLoops >= 1 ? liveCompletedLoops : null);
+    const effectiveSnapshot = snapshotLoop ?? maxLoop;
+    if (effectiveSnapshot < 1) return empty;
+    const greenEnd = Math.min(jerseyGreen || effectiveSnapshot, effectiveSnapshot);
+    const pinkEnd = Math.min(jerseyPink || effectiveSnapshot, effectiveSnapshot);
+    const yellowEnd = Math.min(jerseyYellow || effectiveSnapshot, effectiveSnapshot);
+
+    const sexKey = (r: ResultRow): "K" | "M" | null => {
+      if (r.sex === "K") return "K";
+      if (r.sex === "M") return "M";
+      return null;
+    };
+    const pointsAt = (map: JerseyPointsByBib, bib: string, loop: number): number =>
+      map.get(bib)?.get(loop) ?? 0;
+    const sumPoints = (map: JerseyPointsByBib, bib: string, cap: number): number => {
+      const inner = map.get(bib);
+      if (!inner) return 0;
+      let s = 0;
+      for (const [loop, pts] of inner) if (loop <= cap) s += pts;
+      return s;
+    };
+    const lapSecAt = (r: ResultRow, loop: number): number => {
+      const p = (r.perLoop ?? []).find((x) => x.loop === loop);
+      return typeof p?.lapSec === "number" ? p.lapSec : 0;
+    };
+    const accTotalSec = (r: ResultRow, cap: number): number => {
+      const capped = (r.perLoop ?? []).filter((p) => p.loop <= cap);
+      if (capped.length === 0) return 0;
+      const last = capped[capped.length - 1];
+      if (typeof last.totalSec === "number" && last.totalSec > 0) return last.totalSec;
+      return capped.reduce(
+        (acc, p) => acc + (typeof p.lapSec === "number" ? p.lapSec : 0),
+        0,
+      );
+    };
+
+    for (const sex of ["K", "M"] as const) {
+      const sexRows = rows.filter((r) => sexKey(r) === sex);
+      const pickPoints = (
+        map: JerseyPointsByBib,
+        loop: number,
+      ): string | undefined => {
+        let bestBib: string | undefined;
+        let bestTotal = 0;
+        let bestTie = 0;
+        for (const r of sexRows) {
+          const bib = String(r.bib);
+          const total = sumPoints(map, bib, loop);
+          if (total <= 0) continue;
+          const tie = pointsAt(map, bib, loop);
+          if (total > bestTotal || (total === bestTotal && tie > bestTie)) {
+            bestTotal = total;
+            bestTie = tie;
+            bestBib = bib;
+          }
+        }
+        return bestBib;
+      };
+      const pickYellow = (loop: number): string | undefined => {
+        let bestSec = Number.POSITIVE_INFINITY;
+        let bestTie = Number.POSITIVE_INFINITY;
+        let bestBib: string | undefined;
+        for (const r of sexRows) {
+          if ((r.lapsCompleted ?? 0) < loop) continue;
+          const sec = accTotalSec(r, loop);
+          if (sec <= 0) continue;
+          const tie = lapSecAt(r, loop);
+          if (sec < bestSec || (sec === bestSec && tie < bestTie)) {
+            bestSec = sec;
+            bestTie = tie;
+            bestBib = String(r.bib);
+          }
+        }
+        return bestBib;
+      };
+      for (let loop = 1; loop <= greenEnd; loop += 1) {
+        const bib = pickPoints(greenApiByBib, loop);
+        if (bib)
+          empty.green[sex].set(bib, (empty.green[sex].get(bib) ?? 0) + 1);
+      }
+      for (let loop = 1; loop <= pinkEnd; loop += 1) {
+        const bib = pickPoints(pinkByBib, loop);
+        if (bib)
+          empty.pink[sex].set(bib, (empty.pink[sex].get(bib) ?? 0) + 1);
+      }
+      for (let loop = 1; loop <= yellowEnd; loop += 1) {
+        const bib = pickYellow(loop);
+        if (bib)
+          empty.yellow[sex].set(bib, (empty.yellow[sex].get(bib) ?? 0) + 1);
+      }
+    }
+    return empty;
+  }, [
+    rows,
+    effectiveViewLoop,
+    liveCompletedLoops,
+    maxLoop,
+    greenApiByBib,
+    pinkByBib,
+    jerseyGreen,
+    jerseyPink,
+    jerseyYellow,
+  ]);
+
+  function jerseyCountsForBib(
+    bib: string,
+  ): Partial<Record<"pink" | "green" | "yellow", number>> {
+    const b = String(bib);
+    const out: Partial<Record<"pink" | "green" | "yellow", number>> = {};
+    for (const sex of ["K", "M"] as const) {
+      for (const j of ["pink", "green", "yellow"] as const) {
+        const n = heldCountsByJersey[j][sex].get(b);
+        if (typeof n === "number" && n > 0) out[j] = n;
+      }
+    }
+    return out;
+  }
+
+  // Per-jersey, per-sex "decided / finished" status. Mirrors the
+  // computeJerseyStatus logic from Jerseys.tsx so the Leaderboard
+  // badges can show a ✓ suffix next to the count when the jersey is
+  // mathematically decided (or once the jersey's last loop is done).
+  const jerseyStatuses = useMemo(() => {
+    type S = "decided" | "likely" | "finished" | null;
+    const empty: Record<"pink" | "green" | "yellow", { K: S; M: S }> = {
+      pink: { K: null, M: null },
+      green: { K: null, M: null },
+      yellow: { K: null, M: null },
+    };
+    const snapshotLoop =
+      effectiveViewLoop ?? (liveCompletedLoops >= 1 ? liveCompletedLoops : null);
+
+    const sexKey = (r: ResultRow): "K" | "M" | null => {
+      if (r.sex === "K") return "K";
+      if (r.sex === "M") return "M";
+      return null;
+    };
+    const pointsAt = (map: JerseyPointsByBib, bib: string, loop: number): number =>
+      map.get(bib)?.get(loop) ?? 0;
+    const sumPoints = (map: JerseyPointsByBib, bib: string, cap: number): number => {
+      const inner = map.get(bib);
+      if (!inner) return 0;
+      let s = 0;
+      for (const [loop, pts] of inner) if (loop <= cap) s += pts;
+      return s;
+    };
+    const lapSecAt = (r: ResultRow, loop: number): number => {
+      const p = (r.perLoop ?? []).find((x) => x.loop === loop);
+      return typeof p?.lapSec === "number" ? p.lapSec : 0;
+    };
+    const accTotalSec = (r: ResultRow, cap: number): number => {
+      const capped = (r.perLoop ?? []).filter((p) => p.loop <= cap);
+      if (capped.length === 0) return 0;
+      const last = capped[capped.length - 1];
+      if (typeof last.totalSec === "number" && last.totalSec > 0) return last.totalSec;
+      return capped.reduce(
+        (acc, p) => acc + (typeof p.lapSec === "number" ? p.lapSec : 0),
+        0,
+      );
+    };
+
+    const MAX_PTS = { pink: 3, green: 10 } as const;
+
+    const computePoints = (
+      jersey: "pink" | "green",
+      map: JerseyPointsByBib,
+      endsAt: number,
+      sex: "K" | "M",
+    ): S => {
+      if (snapshotLoop === null) return null;
+      if (snapshotLoop >= endsAt) return "finished";
+      const remaining = endsAt - snapshotLoop;
+      if (remaining <= 0) return "finished";
+      const sexRows = rows.filter((r) => sexKey(r) === sex);
+      const totals: { bib: string; total: number; tie: number }[] = [];
+      const cap = Math.min(endsAt, snapshotLoop);
+      for (const r of sexRows) {
+        const bib = String(r.bib);
+        const total = sumPoints(map, bib, cap);
+        if (total <= 0) continue;
+        totals.push({ bib, total, tie: pointsAt(map, bib, cap) });
+      }
+      if (totals.length === 0) return null;
+      totals.sort((a, b) =>
+        b.total !== a.total ? b.total - a.total : b.tie - a.tie,
+      );
+      const leader = totals[0].total;
+      const runnerUp = totals[1]?.total ?? 0;
+      const lead = leader - runnerUp;
+      const max = remaining * MAX_PTS[jersey];
+      if (lead > max) return "decided";
+      if (lead > max * 0.5) return "likely";
+      return null;
+    };
+
+    const computeYellow = (endsAt: number, sex: "K" | "M"): S => {
+      if (snapshotLoop === null) return null;
+      if (snapshotLoop >= endsAt) return "finished";
+      const remaining = endsAt - snapshotLoop;
+      if (remaining <= 0) return "finished";
+      const cap = Math.min(endsAt, snapshotLoop);
+      const sexRows = rows.filter((r) => sexKey(r) === sex);
+      const totals: { bib: string; sec: number; tie: number }[] = [];
+      for (const r of sexRows) {
+        if ((r.lapsCompleted ?? 0) < cap) continue;
+        const sec = accTotalSec(r, cap);
+        if (sec <= 0) continue;
+        totals.push({ bib: String(r.bib), sec, tie: lapSecAt(r, cap) });
+      }
+      if (totals.length === 0) return null;
+      totals.sort((a, b) => (a.sec !== b.sec ? a.sec - b.sec : a.tie - b.tie));
+      if (totals.length < 2) return "decided";
+      // The runner-up can claw back at most one minimum lap time per
+      // remaining loop (10 min).
+      const YELLOW_MIN_LAP_SEC = 10 * 60;
+      const gap = totals[1].sec - totals[0].sec;
+      const max = remaining * YELLOW_MIN_LAP_SEC;
+      if (gap > max) return "decided";
+      if (gap > max * 0.5) return "likely";
+      return null;
+    };
+
+    for (const sex of ["K", "M"] as const) {
+      empty.pink[sex] = computePoints("pink", pinkByBib, jerseyPink, sex);
+      empty.green[sex] = computePoints("green", greenApiByBib, jerseyGreen, sex);
+      empty.yellow[sex] = computeYellow(jerseyYellow, sex);
+    }
+    return empty;
+  }, [
+    rows,
+    effectiveViewLoop,
+    liveCompletedLoops,
+    raceFinished,
+    greenApiByBib,
+    pinkByBib,
+    jerseyGreen,
+    jerseyPink,
+    jerseyYellow,
+  ]);
+
+  const winners = useMemo(() => {
+    const empty: { K: WinnerRow | null; M: WinnerRow | null } = { K: null, M: null };
+    if (mode !== "frontyard") return empty;
+    const snapshotLoop =
+      effectiveViewLoop ?? (liveCompletedLoops >= 1 ? liveCompletedLoops : null);
+    if (snapshotLoop === null) return empty;
+    // Only reveal the overall winner once the race is decided.
+    if (!isRaceOver(raceFinished, snapshotLoop, jerseyYellow)) return empty;
+    const yellowEntries: JerseyEntry[] = rows.map((r) => ({
+      bib: String(r.bib),
+      name: r.name,
+      club: r.club,
+      sex: r.sex,
+      perLoop: (r.perLoop ?? []).map((p) => ({
+        loop: p.loop,
+        lapSec: typeof p.lapSec === "number" ? p.lapSec : 0,
+        totalSec: typeof p.totalSec === "number" ? p.totalSec : 0,
+      })),
+    })) as unknown as JerseyEntry[];
+    const sexLookup = buildSexLookup({ green: [], pink: [], yellow: yellowEntries });
+    return {
+      K: computeWinner(yellowEntries, sexLookup, "K", jerseyYellow, snapshotLoop, fyLock),
+      M: computeWinner(yellowEntries, sexLookup, "M", jerseyYellow, snapshotLoop, fyLock),
+    };
+  }, [mode, rows, effectiveViewLoop, liveCompletedLoops, jerseyYellow, fyLock, raceFinished]);
+
+  function jerseyStatusesForBib(
+    bib: string,
+  ): Partial<Record<"pink" | "green" | "yellow", "decided" | "likely" | "finished">> {
+    const b = String(bib);
+    const out: Partial<
+      Record<"pink" | "green" | "yellow", "decided" | "likely" | "finished">
+    > = {};
+    for (const sex of ["K", "M"] as const) {
+      for (const j of ["pink", "green", "yellow"] as const) {
+        if (jerseyHolders[j][sex] !== b) continue;
+        const s = jerseyStatuses[j][sex];
+        if (s) out[j] = s;
+      }
+    }
+    return out;
+  }
+
   function toggleSort(key: SortKey) {
     if (key === sortKey) {
       setSortDir(sortDir === "asc" ? "desc" : "asc");
@@ -783,9 +1088,25 @@ export function Leaderboard({ eventId }: { eventId: string }) {
       >
         <td style={tdNum}>{r.bib}</td>
         <td style={td}>
+          {(() => {
+            const sx = r.sex === "K" ? "K" : r.sex === "M" ? "M" : null;
+            const isWinner = sx !== null && winners[sx]?.bib === String(r.bib);
+            return isWinner ? (
+              <span
+                title="Overall winner — fastest lap on the highest loop completed within the time limit"
+                style={{ marginRight: "0.3rem" }}
+              >
+                🏆
+              </span>
+            ) : null;
+          })()}
           {r.name}
           {mode === "frontyard" && (
-            <JerseyBadges jerseys={jerseysForBib(r.bib)} />
+            <JerseyBadges
+              jerseys={jerseysForBib(r.bib)}
+              counts={jerseyCountsForBib(r.bib)}
+              statuses={jerseyStatusesForBib(r.bib)}
+            />
           )}
         </td>
         <td style={td}>{r.total || "—"}</td>
@@ -872,15 +1193,16 @@ export function Leaderboard({ eventId }: { eventId: string }) {
         if (text.length > maxLen) maxLen = text.length;
       }
       // The name cell may also render up to 3 jersey badges (frontyard only).
-      // Each badge is ~1.1rem wide with a small gap; reserve ~3ch per badge
-      // plus a small left margin so both gender tables agree on width.
+      // Each badge is ~1.1rem wide with a small gap; reserve ~5ch per badge
+      // (count digits + decided/finished suffix) plus a small left margin so
+      // both gender tables agree on width.
       if (col.key === "name" && mode === "frontyard") {
         let maxBadges = 0;
         for (const r of rows) {
           const n = jerseysForBib(r.bib).length;
           if (n > maxBadges) maxBadges = n;
         }
-        if (maxBadges > 0) maxLen += 1 + maxBadges * 3;
+        if (maxBadges > 0) maxLen += 1 + maxBadges * 5;
       }
       // 1ch ≈ width of "0". Add padding for cell padding (~1.5ch).
       return `${maxLen + 2}ch`;
@@ -891,6 +1213,25 @@ export function Leaderboard({ eventId }: { eventId: string }) {
     const colWidths = computeColWidths([...femaleRows, ...maleRows]);
     return (
       <>
+        {mode === "frontyard" && (
+          <p
+            style={{
+              margin: "0.25rem 0 0",
+              fontSize: "0.78rem",
+              color: "#555",
+              alignSelf: "flex-start",
+            }}
+          >
+            Jersey badges next to a runner's name show the number of loops they
+            have held that jersey. A trailing{" "}
+            <span aria-label="likely">~</span> means the leader is likely
+            (lead exceeds half of the runner-up's max catch-up),{" "}
+            <span aria-label="decided">✓</span> means the jersey is decided
+            (mathematically uncatchable), and{" "}
+            <span aria-label="finished">★</span> means the jersey's last loop
+            has been completed.
+          </p>
+        )}
         <h3 style={{ margin: "0.5rem 0 0", alignSelf: "flex-start" }}>
           Female ({femaleRows.length})
         </h3>
@@ -1106,34 +1447,64 @@ const JERSEY_LETTER: Record<"pink" | "green" | "yellow", string> = {
 
 function JerseyBadges({
   jerseys,
+  counts,
+  statuses,
 }: {
   jerseys: ("pink" | "green" | "yellow")[];
+  counts?: Partial<Record<"pink" | "green" | "yellow", number>>;
+  statuses?: Partial<Record<"pink" | "green" | "yellow", "decided" | "likely" | "finished">>;
 }) {
   if (!jerseys || jerseys.length === 0) return null;
   return (
     <span style={{ display: "inline-flex", gap: "0.2rem", marginLeft: "0.4rem" }}>
-      {jerseys.map((j) => (
-        <span
-          key={j}
-          title={`Current ${j} jersey holder`}
-          aria-label={`${j} jersey`}
-          style={{
-            display: "inline-block",
-            minWidth: "1.1rem",
-            padding: "0 0.35rem",
-            borderRadius: "0.65rem",
-            background: JERSEY_BG[j],
-            color: JERSEY_FG[j],
-            fontSize: "0.72rem",
-            fontWeight: 700,
-            textAlign: "center",
-            lineHeight: "1.1rem",
-            border: "1px solid rgba(0,0,0,0.1)",
-          }}
-        >
-          {JERSEY_LETTER[j]}
-        </span>
-      ))}
+      {jerseys.map((j) => {
+        const count = counts?.[j];
+        const status = statuses?.[j];
+        const base =
+          typeof count === "number" ? String(count) : JERSEY_LETTER[j];
+        // Suffix: ~ likely, ✓ decided, ★ finished.
+        const suffix =
+          status === "finished"
+            ? " \u2605"
+            : status === "decided"
+              ? " \u2713"
+              : status === "likely"
+                ? " ~"
+                : "";
+        const label = `${base}${suffix}`;
+        const title =
+          status === "finished"
+            ? `${j} jersey finished${typeof count === "number" ? ` · held on ${count} loop(s)` : ""}`
+            : status === "decided"
+              ? `${j} jersey decided${typeof count === "number" ? ` · held on ${count} loop(s)` : ""}`
+              : status === "likely"
+                ? `${j} jersey likely (lead > half of runner-up's max catch-up)${typeof count === "number" ? ` · held on ${count} loop(s)` : ""}`
+                : typeof count === "number"
+                  ? `Held the ${j} jersey on ${count} loop(s)`
+                  : `Current ${j} jersey holder`;
+        return (
+          <span
+            key={j}
+            title={title}
+            aria-label={`${j} jersey${status ? ` ${status}` : ""}`}
+            style={{
+              display: "inline-block",
+              minWidth: "1.1rem",
+              padding: "0 0.35rem",
+              borderRadius: "0.65rem",
+              background: JERSEY_BG[j],
+              color: JERSEY_FG[j],
+              fontSize: "0.72rem",
+              fontWeight: 700,
+              textAlign: "center",
+              lineHeight: "1.1rem",
+              border: "1px solid rgba(0,0,0,0.1)",
+            }}
+          >
+            {label}
+          </span>
+        );
+      })}
     </span>
   );
 }
