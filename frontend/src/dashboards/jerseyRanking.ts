@@ -57,9 +57,86 @@ export type DisplayRow = {
   name: string;
   club: string;
   value: string;
+  /** Raw numeric value behind `value` (points for pink/green, total
+   * seconds for yellow). Used by the Jerseys dashboard to compute
+   * whether the standings are mathematically decided. */
+  rawValue?: number;
   sub?: string;
   jerseys?: ("pink" | "green" | "yellow")[];
+  /** Optional per-jersey "loops held" count, attached by the Jerseys
+   * dashboard so the inline badges can show a number instead of the
+   * redundant P/G/Y letter. */
+  jerseyCounts?: Partial<Record<"pink" | "green" | "yellow", number>>;
 };
+
+/** Maximum points the runner-up could still score on a single remaining
+ * loop. Used by `computeJerseyStatus` to decide whether the leader's
+ * advantage is mathematically insurmountable for the pink/green
+ * point-based jerseys. */
+export const MAX_POINTS_PER_LOOP: Record<"pink" | "green", number> = {
+  pink: 3,
+  green: 10,
+};
+
+/** Lower bound (seconds) on a yellow-jersey lap time. Also used as
+ * the maximum amount of cumulative-time the runner-up can claw back
+ * from the leader on a single remaining loop — so the yellow jersey
+ * is DECIDED when the leader's lead in seconds exceeds
+ *   `remaining_loops × YELLOW_MIN_LAP_SEC`. */
+export const YELLOW_MIN_LAP_SEC = 10 * 60;
+
+/** Fraction of the DECIDED threshold above which the standings are
+ * considered LIKELY: the lead is more than half of what the runner-up
+ * could theoretically claw back, so the leader is the heavy favourite
+ * even though it isn't yet mathematically locked. */
+export const LIKELY_THRESHOLD_FRACTION = 0.5;
+
+export type JerseyStatus = "decided" | "likely" | "finished" | null;
+
+/** Determine whether a jersey's standings are mathematically decided
+ * (leader cannot be caught even if they score nothing in the remaining
+ * loops), likely (lead exceeds half of the worst-case catch-up), or
+ * finished (the jersey's last loop has been raced).
+ *
+ * `raceFinished` is intentionally NOT a short-circuit: during playback
+ * of earlier loops, the global race may be finished while the displayed
+ * snapshot is mid-race; in that case the status should reflect the
+ * snapshot so DECIDED is still meaningful when scrubbing back. */
+export function computeJerseyStatus(
+  rows: DisplayRow[],
+  jersey: "pink" | "green" | "yellow",
+  endsAt: number,
+  snapshotLoop: number | null,
+  _raceFinished: boolean,
+): JerseyStatus {
+  void _raceFinished;
+  if (snapshotLoop !== null && snapshotLoop >= endsAt) return "finished";
+  if (snapshotLoop === null) return null;
+  if (rows.length === 0) return null;
+  const leader = rows[0]?.rawValue;
+  if (typeof leader !== "number") return null;
+  const remaining = endsAt - snapshotLoop;
+  if (remaining <= 0) return "finished";
+
+  if (jersey === "yellow") {
+    if (rows.length < 2) return "decided";
+    const runnerUp = rows[1]?.rawValue;
+    if (typeof runnerUp !== "number") return null;
+    const gap = runnerUp - leader;
+    const max = remaining * YELLOW_MIN_LAP_SEC;
+    if (gap > max) return "decided";
+    if (gap > max * LIKELY_THRESHOLD_FRACTION) return "likely";
+    return null;
+  }
+
+  const maxPts = MAX_POINTS_PER_LOOP[jersey];
+  const runnerUp = rows[1]?.rawValue ?? 0;
+  const lead = leader - runnerUp;
+  const max = remaining * maxPts;
+  if (lead > max) return "decided";
+  if (lead > max * LIKELY_THRESHOLD_FRACTION) return "likely";
+  return null;
+}
 
 /** Sum the runner's perLoop points up to (and including) `maxLoop`.
  * Falls back to the backend-reported total if no perLoop data exists. */
@@ -115,6 +192,98 @@ export function lastCompletedLoop(entry: JerseyEntry): number {
   return max;
 }
 
+/** First-loop length in minutes for the frontyard schedule. Kept local
+ * to this module (rather than imported from timerCore) so jerseyRanking
+ * stays free of UI-only dependencies. */
+const FRONTYARD_FIRST_LOOP_MIN = 30;
+
+/** Length (in seconds) of frontyard loop `loop` given the configured
+ * `lockAfter` hold loop. Loops 1..lockAfter shrink by 1 min each;
+ * loops > lockAfter reuse the length of loop `lockAfter`. */
+export function frontyardLoopLengthSec(
+  loop: number,
+  lockAfter: number,
+): number {
+  const lockedLen = Math.max(1, FRONTYARD_FIRST_LOOP_MIN + 1 - lockAfter);
+  const naturalLen = Math.max(1, FRONTYARD_FIRST_LOOP_MIN + 1 - loop);
+  const len = loop <= lockAfter ? naturalLen : lockedLen;
+  return len * 60;
+}
+
+export type WinnerRow = {
+  bib: string;
+  name: string;
+  club: string;
+  /** The decisive loop — the highest one on which the runner finished
+   * within the time limit. */
+  lap: number;
+  /** Lap time on `lap` (seconds). */
+  lapSec: number;
+  /** Cumulative race time through `lap` (seconds). */
+  totalSec: number;
+};
+
+/** Returns `true` once the frontyard race is over: either the backend
+ * flagged the race as finished, or the snapshot has reached the
+ * configured Yellow & Winner end-loop. Used by all three dashboards
+ * to gate the overall-winner indicator. */
+export function isRaceOver(
+  raceFinished: boolean,
+  snapshotLoop: number | null,
+  jerseyYellow: number,
+): boolean {
+  if (raceFinished) return true;
+  if (snapshotLoop === null) return false;
+  return snapshotLoop >= jerseyYellow;
+}
+
+/** Compute the overall winner of the frontyard race, per sex.
+ *
+ * Rule: the winner is the runner with the fastest lap on the highest
+ * loop L ≤ `min(snapshotLoop, jerseyYellow)` that any runner of the
+ * given sex completed within the loop's time limit. A solo "going out
+ * alone" attempt counts only if the runner makes it back inside the
+ * limit; otherwise the previous loop's winner stands.
+ *
+ * Returns `null` if no runner of `sex` has any completed loop within
+ * the time limit yet (or if no snapshot is available). */
+export function computeWinner(
+  yellowEntries: JerseyEntry[],
+  sexLookup: Map<string, string>,
+  sex: Sex,
+  jerseyYellow: number,
+  snapshotLoop: number | null,
+  lockAfter: number,
+): WinnerRow | null {
+  if (snapshotLoop === null || snapshotLoop < 1) return null;
+  const top = Math.min(snapshotLoop, jerseyYellow);
+  const sexed = yellowEntries.filter((e) => resolveSex(e, sexLookup) === sex);
+  for (let L = top; L >= 1; L -= 1) {
+    const limit = frontyardLoopLengthSec(L, lockAfter);
+    type Cand = { e: JerseyEntry; lapSec: number };
+    const candidates: Cand[] = [];
+    for (const e of sexed) {
+      const per = (e.perLoop ?? []).find((p) => p.loop === L);
+      const lapSec = per?.lapSec;
+      if (typeof lapSec === "number" && lapSec > 0 && lapSec <= limit) {
+        candidates.push({ e, lapSec });
+      }
+    }
+    if (candidates.length === 0) continue;
+    candidates.sort((a, b) => a.lapSec - b.lapSec);
+    const w = candidates[0];
+    return {
+      bib: w.e.bib,
+      name: w.e.name,
+      club: w.e.club,
+      lap: L,
+      lapSec: w.lapSec,
+      totalSec: accTimeUpto(w.e, L),
+    };
+  }
+  return null;
+}
+
 /** Resolve a runner's sex from supplementary lookup maps. The yellow
  * (and most green) lists publish a sex column, but the pink list does
  * not, so we cross-reference the other lists by bib. */
@@ -164,6 +333,7 @@ export function rankByPoints(
       name: e.name,
       club: e.club,
       value: `${pts} p`,
+      rawValue: pts,
     }));
   }
   return out;
@@ -210,6 +380,7 @@ export function rankYellow(
       name: e.name,
       club: e.club,
       value: formatHms(rankingTime(e)),
+      rawValue: rankingTime(e),
       sub:
         typeof e.lapsCompleted === "number"
           ? `(${

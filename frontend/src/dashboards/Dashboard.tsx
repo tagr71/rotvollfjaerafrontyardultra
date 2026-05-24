@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  buildSexLookup,
+  computeWinner,
+  isRaceOver,
+  type JerseyEntry,
+  type WinnerRow,
+} from "./jerseyRanking";
+import {
   BACKYARD_LOOP_KM,
   FRONTYARD_LOOP_KM,
   FRONTYARD_START_MIN,
@@ -98,6 +105,7 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
   type HolderEntry = {
     bib: string;
     name: string;
+    club?: string;
     sex: string;
     points?: number;
     total?: string;
@@ -307,6 +315,206 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
     return result;
   }, [jerseyData, holderSnapshotLoop, jerseyPink, jerseyGreen, jerseyYellow]);
 
+  /** For every loop 1..effectiveSnapshot, count how many times each
+   * runner has been the rank-1 jersey holder (per jersey × sex). Used
+   * to show a "loops held" number badge next to each holder. */
+  const heldCountsByJersey = useMemo(() => {
+    const empty: Record<
+      "pink" | "green" | "yellow",
+      Record<"K" | "M", Map<string, number>>
+    > = {
+      pink: { K: new Map(), M: new Map() },
+      green: { K: new Map(), M: new Map() },
+      yellow: { K: new Map(), M: new Map() },
+    };
+    if (!jerseyData || holderSnapshotLoop < 1) return empty;
+    const sexLookup = new Map<string, string>();
+    for (const e of jerseyData.green) {
+      if (e.sex === "M" || e.sex === "K") sexLookup.set(e.bib, e.sex);
+    }
+    for (const e of jerseyData.yellow) {
+      if (e.sex === "M" || e.sex === "K") sexLookup.set(e.bib, e.sex);
+    }
+    const resolveSex = (e: HolderEntry) =>
+      e.sex === "M" || e.sex === "K" ? e.sex : sexLookup.get(e.bib) ?? "";
+    const sumUpto = (e: HolderEntry, cap: number) =>
+      (e.perLoop ?? [])
+        .filter((p) => p.loop <= cap)
+        .reduce((acc, p) => acc + (p.points ?? 0), 0);
+    const pointsAtLoop = (e: HolderEntry, loop: number): number =>
+      (e.perLoop ?? []).find((p) => p.loop === loop)?.points ?? 0;
+    const lapSecAtLoop = (e: HolderEntry, loop: number): number =>
+      (e.perLoop ?? []).find((p) => p.loop === loop)?.lapSec ?? 0;
+    const accTimeUpto = (e: HolderEntry, cap: number): number => {
+      const capped = (e.perLoop ?? []).filter((p) => p.loop <= cap);
+      if (capped.length > 0) {
+        const last = capped[capped.length - 1];
+        if (typeof last.totalSec === "number" && last.totalSec > 0) {
+          return last.totalSec;
+        }
+        const sum = capped.reduce(
+          (acc, p) => acc + (typeof p.lapSec === "number" ? p.lapSec : 0),
+          0,
+        );
+        if (sum > 0) return sum;
+      }
+      return e.totalSec ?? 0;
+    };
+    const pinkEnd = Math.min(jerseyPink, holderSnapshotLoop);
+    const greenEnd = Math.min(jerseyGreen, holderSnapshotLoop);
+    const yellowEnd = Math.min(jerseyYellow, holderSnapshotLoop);
+    for (const sex of ["K", "M"] as const) {
+      const pinkSex = jerseyData.pink.filter((e) => resolveSex(e) === sex);
+      const greenSex = jerseyData.green.filter((e) => resolveSex(e) === sex);
+      const yellowSex = jerseyData.yellow.filter((e) => resolveSex(e) === sex);
+      const tally = (
+        bucket: Map<string, number>,
+        bib: string | undefined,
+      ) => {
+        if (!bib) return;
+        bucket.set(bib, (bucket.get(bib) ?? 0) + 1);
+      };
+      for (let loop = 1; loop <= pinkEnd; loop += 1) {
+        const top = pinkSex
+          .map((e) => ({ e, pts: sumUpto(e, loop) }))
+          .filter((x) => x.pts > 0)
+          .sort((a, b) =>
+            b.pts !== a.pts
+              ? b.pts - a.pts
+              : pointsAtLoop(b.e, loop) - pointsAtLoop(a.e, loop),
+          )[0];
+        tally(empty.pink[sex], top?.e.bib);
+      }
+      for (let loop = 1; loop <= greenEnd; loop += 1) {
+        const top = greenSex
+          .map((e) => ({ e, pts: sumUpto(e, loop) }))
+          .filter((x) => x.pts > 0)
+          .sort((a, b) =>
+            b.pts !== a.pts
+              ? b.pts - a.pts
+              : pointsAtLoop(b.e, loop) - pointsAtLoop(a.e, loop),
+          )[0];
+        tally(empty.green[sex], top?.e.bib);
+      }
+      for (let loop = 1; loop <= yellowEnd; loop += 1) {
+        const top = yellowSex
+          .filter((e) => {
+            const lc = typeof e.lapsCompleted === "number" ? e.lapsCompleted : 0;
+            return lc >= loop && accTimeUpto(e, loop) > 0;
+          })
+          .sort((a, b) => {
+            const ta = accTimeUpto(a, loop);
+            const tb = accTimeUpto(b, loop);
+            if (ta !== tb) return ta - tb;
+            return lapSecAtLoop(a, loop) - lapSecAtLoop(b, loop);
+          })[0];
+        tally(empty.yellow[sex], top?.bib);
+      }
+    }
+    return empty;
+  }, [jerseyData, holderSnapshotLoop, jerseyPink, jerseyGreen, jerseyYellow]);
+
+  /** Per-jersey × sex DECIDED/LIKELY/FINISHED status. Mirrors the
+   * logic used in Jerseys.tsx and Leaderboard.tsx: pink ≤ 3 pts/loop,
+   * green ≤ 10, yellow uses a symmetric 10-min min-pace assumption.
+   * LIKELY = lead exceeds half of the runner-up's max catch-up. */
+  const jerseyStatuses = useMemo(() => {
+    type S = "decided" | "likely" | "finished" | null;
+    const empty: Record<"pink" | "green" | "yellow", { K: S; M: S }> = {
+      pink: { K: null, M: null },
+      green: { K: null, M: null },
+      yellow: { K: null, M: null },
+    };
+    if (mode !== "frontyard") return empty;
+    const snapshotLoop = holderSnapshotLoop;
+    const checkPoints = (
+      jersey: "pink" | "green",
+      list: { value: string }[],
+      endsAt: number,
+    ): S => {
+      if (snapshotLoop >= endsAt) return "finished";
+      if (snapshotLoop < 1 || list.length === 0) return null;
+      const parse = (v: string) => {
+        const n = parseInt(v, 10);
+        return Number.isFinite(n) ? n : 0;
+      };
+      const leader = parse(list[0].value);
+      const runnerUp = list[1] ? parse(list[1].value) : 0;
+      const remaining = endsAt - snapshotLoop;
+      const maxPts = jersey === "pink" ? 3 : 10;
+      const lead = leader - runnerUp;
+      const max = remaining * maxPts;
+      if (lead > max) return "decided";
+      if (lead > max * 0.5) return "likely";
+      return null;
+    };
+    const checkYellow = (
+      list: { value: string }[],
+      endsAt: number,
+    ): S => {
+      if (snapshotLoop >= endsAt) return "finished";
+      if (snapshotLoop < 1 || list.length === 0) return null;
+      // Time format from formatHms is "H:MM:SS" or "MM:SS". Convert to sec.
+      const toSec = (v: string): number => {
+        const parts = v.split(":").map((s) => parseInt(s, 10) || 0);
+        if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+        if (parts.length === 2) return parts[0] * 60 + parts[1];
+        return 0;
+      };
+      const leader = toSec(list[0].value);
+      if (list.length < 2) return "decided";
+      const runnerUp = toSec(list[1].value);
+      const remaining = endsAt - snapshotLoop;
+      // Runner-up can claw back at most one minimum lap time per
+      // remaining loop (10 min).
+      const closurePerLoop = 10 * 60;
+      const gap = runnerUp - leader;
+      const max = remaining * closurePerLoop;
+      if (gap > max) return "decided";
+      if (gap > max * 0.5) return "likely";
+      return null;
+    };
+    for (const sex of ["K", "M"] as const) {
+      empty.pink[sex] = checkPoints("pink", jerseyHolders.pink[sex], jerseyPink);
+      empty.green[sex] = checkPoints("green", jerseyHolders.green[sex], jerseyGreen);
+      empty.yellow[sex] = checkYellow(jerseyHolders.yellow[sex], jerseyYellow);
+    }
+    return empty;
+  }, [
+    mode,
+    holderSnapshotLoop,
+    raceFinished,
+    jerseyHolders,
+    jerseyPink,
+    jerseyGreen,
+    jerseyYellow,
+  ]);
+
+  /** Overall race winner per sex, frontyard only. Rule: fastest lap on
+   * the highest loop ≤ min(snapshotLoop, jerseyYellow) that the runner
+   * completed within that loop's time limit. A solo "going out alone"
+   * attempt counts only if completed inside the limit; otherwise the
+   * previous loop's winner stands. */
+  const winners = useMemo(() => {
+    const empty: { K: WinnerRow | null; M: WinnerRow | null } = {
+      K: null,
+      M: null,
+    };
+    if (mode !== "frontyard" || !jerseyData) return empty;
+    // The overall winner is only revealed once the race is decided.
+    if (!isRaceOver(raceFinished, holderSnapshotLoop, jerseyYellow)) return empty;
+    const yellow = jerseyData.yellow as unknown as JerseyEntry[];
+    const sexLookup = buildSexLookup({
+      green: jerseyData.green as unknown as JerseyEntry[],
+      pink: jerseyData.pink as unknown as JerseyEntry[],
+      yellow,
+    });
+    return {
+      K: computeWinner(yellow, sexLookup, "K", jerseyYellow, holderSnapshotLoop, fyLock),
+      M: computeWinner(yellow, sexLookup, "M", jerseyYellow, holderSnapshotLoop, fyLock),
+    };
+  }, [mode, jerseyData, jerseyYellow, holderSnapshotLoop, fyLock, raceFinished]);
+
   // Derive the runners-this-loop / completed-past-loop counters. The
   // detailed semantics are documented inline below; in short:
   //   startingThisLoop   = runners actively in loop N (subset of below)
@@ -431,6 +639,11 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
               : frozen
                 ? `frozen at loop ${c.endsAt}`
                 : `after ${Math.min(holderSnapshotLoop, c.endsAt)} of ${c.endsAt} loops`;
+          // Color tokens for the inline "loops held" pill — match the
+          // jersey palette used elsewhere in the app (Jerseys.tsx /
+          // Leaderboard.tsx) so the visual language is consistent.
+          const pillBg = c.key === "yellow" ? "#facc15" : c.key === "pink" ? "#ec4899" : "#16a34a";
+          const pillFg = c.key === "yellow" ? "#1f2937" : "#fff";
           return (
             <div
               key={c.key}
@@ -464,6 +677,15 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
               {(["K", "M"] as const).map((sex) => {
                 const list = h[sex];
                 const sexLabel = sex === "K" ? "Female" : "Male";
+                const status = jerseyStatuses[c.key][sex];
+                const statusLabel =
+                  status === "finished"
+                    ? "★ FINISHED"
+                    : status === "decided"
+                      ? "✓ DECIDED"
+                      : status === "likely"
+                        ? "~ LIKELY"
+                        : null;
                 return (
                   <div
                     key={sex}
@@ -479,12 +701,46 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
                         fontWeight: 600,
                         fontSize: "0.8rem",
                         marginBottom: "0.15rem",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
                       }}
                     >
-                      {sexLabel}
+                      <span>{sexLabel}</span>
+                      {statusLabel && (
+                        <span
+                          style={{
+                            background:
+                              status === "finished"
+                                ? "#1f2937"
+                                : status === "decided"
+                                  ? "#2563eb"
+                                  : "#d97706",
+                            color: "#fff",
+                            fontSize: "0.65rem",
+                            fontWeight: 700,
+                            padding: "0.05rem 0.4rem",
+                            borderRadius: "0.5rem",
+                            letterSpacing: "0.03em",
+                          }}
+                          title={
+                            status === "finished"
+                              ? `The ${c.key} jersey's last loop has been completed`
+                              : status === "decided"
+                                ? `The ${c.key} jersey is mathematically decided`
+                                : `The ${c.key} jersey leader is likely (lead > half of runner-up's max catch-up)`
+                          }
+                        >
+                          {statusLabel}
+                        </span>
+                      )}
                     </div>
                     {[0, 1, 2].map((i) => {
                       const holder = list[i];
+                      const heldCount = holder
+                        ? heldCountsByJersey[c.key][sex].get(holder.bib)
+                        : undefined;
+                      const isLeader = i === 0;
                       return (
                         <div
                           key={i}
@@ -493,24 +749,47 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
                             justifyContent: "space-between",
                             alignItems: "baseline",
                             gap: "0.5rem",
-                            padding: "0.1rem 0",
+                            padding: isLeader ? "0.2rem 0.35rem" : "0.1rem 0",
+                            background: isLeader ? "rgba(255,255,255,0.7)" : "transparent",
+                            border: isLeader ? `2px solid ${pillBg}` : "none",
+                            borderRadius: isLeader ? "0.35rem" : 0,
+                            marginBottom: isLeader ? "0.2rem" : 0,
                           }}
                         >
                           <span
                             style={{
-                              color: "#777",
-                              fontWeight: 600,
-                              fontSize: "0.85rem",
+                              color: isLeader ? "#111" : "#777",
+                              fontWeight: isLeader ? 800 : 600,
+                              fontSize: isLeader ? "0.95rem" : "0.85rem",
                               minWidth: "1rem",
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: "0.15rem",
                             }}
                           >
-                            {i + 1}.
+                            {isLeader && holder ? (
+                              <img
+                                src={c.img}
+                                alt=""
+                                aria-hidden="true"
+                                title="Current jersey holder"
+                                style={{
+                                  height: "1.1rem",
+                                  width: "auto",
+                                  objectFit: "contain",
+                                  display: "inline-block",
+                                  verticalAlign: "middle",
+                                }}
+                              />
+                            ) : (
+                              <>{i + 1}.</>
+                            )}
                           </span>
                           <span
                             style={{
-                              color: "#555",
-                              fontWeight: 600,
-                              fontSize: "0.85rem",
+                              color: isLeader ? "#111" : "#555",
+                              fontWeight: isLeader ? 800 : 600,
+                              fontSize: isLeader ? "0.95rem" : "0.85rem",
                               fontVariantNumeric: "tabular-nums",
                               minWidth: "2.2rem",
                               textAlign: "right",
@@ -526,16 +805,51 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
                               overflow: "hidden",
                               textOverflow: "ellipsis",
                               whiteSpace: "nowrap",
-                              fontSize: "0.9rem",
+                              fontSize: isLeader ? "1rem" : "0.9rem",
+                              fontWeight: isLeader ? 800 : 400,
+                              color: isLeader ? "#111" : undefined,
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: "0.35rem",
                             }}
                           >
-                            {holder?.name ?? "—"}
+                            <span
+                              style={{
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {holder?.name ?? "—"}
+                            </span>
+                            {typeof heldCount === "number" && heldCount > 0 && (
+                              <span
+                                title={`Held the ${c.key} jersey on ${heldCount} loop(s)`}
+                                aria-label={`${c.key} jersey loops held`}
+                                style={{
+                                  display: "inline-block",
+                                  minWidth: "1.1rem",
+                                  padding: "0 0.35rem",
+                                  borderRadius: "0.65rem",
+                                  background: pillBg,
+                                  color: pillFg,
+                                  fontSize: "0.7rem",
+                                  fontWeight: 700,
+                                  textAlign: "center",
+                                  lineHeight: "1.1rem",
+                                  border: "1px solid rgba(0,0,0,0.1)",
+                                }}
+                              >
+                                {heldCount}
+                              </span>
+                            )}
                           </span>
                           <span
                             style={{
                               fontVariantNumeric: "tabular-nums",
-                              fontWeight: 600,
-                              fontSize: "0.9rem",
+                              fontWeight: isLeader ? 800 : 600,
+                              fontSize: isLeader ? "1rem" : "0.9rem",
+                              color: isLeader ? "#111" : undefined,
                             }}
                           >
                             {holder?.value ?? "—"}
@@ -546,6 +860,70 @@ export function Dashboard({ eventId, eventName, eventLocation }: { eventId: stri
                   </div>
                 );
               })}
+              {c.key === "yellow" && (winners.K || winners.M) && (
+                <div
+                  style={{
+                    marginTop: "0.4rem",
+                    paddingTop: "0.35rem",
+                    borderTop: "1px solid rgba(0,0,0,0.15)",
+                  }}
+                >
+                  <div
+                    style={{
+                      fontWeight: 800,
+                      fontSize: "0.8rem",
+                      color: "#1f2937",
+                      marginBottom: "0.15rem",
+                      textAlign: "center",
+                    }}
+                  >
+                    🏆 Overall winner
+                  </div>
+                  {(["K", "M"] as const).map((sx) => {
+                    const w = winners[sx];
+                    if (!w) return null;
+                    return (
+                      <div
+                        key={sx}
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "baseline",
+                          gap: "0.4rem",
+                          fontSize: "0.85rem",
+                          padding: "0.1rem 0",
+                        }}
+                      >
+                        <span style={{ color: "#555", fontWeight: 700, minWidth: "3.2rem" }}>
+                          {sx === "K" ? "Female" : "Male"}
+                        </span>
+                        <span
+                          style={{
+                            color: "#111",
+                            fontWeight: 700,
+                            flex: "1 1 auto",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                          title={`Decided on loop ${w.lap} — fastest lap on that loop`}
+                        >
+                          #{w.bib} {w.name}
+                        </span>
+                        <span
+                          style={{
+                            color: "#555",
+                            fontVariantNumeric: "tabular-nums",
+                            fontSize: "0.8rem",
+                          }}
+                        >
+                          L{w.lap} · {formatHms(w.lapSec)}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
               <p
                 style={{
                   margin: 0,
