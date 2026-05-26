@@ -1,0 +1,77 @@
+{
+  "settings" : [ {
+    "key" : "firstLoopMin",
+    "valueType" : "number",
+    "defaultValue" : 30,
+    "configTitle" : "FirstLoopMinTitle",
+    "configPrompt" : "FirstLoopMinPrompt",
+    "configType" : "numeric",
+    "configError" : null,
+    "configHelpUrl" : null,
+    "configReadonly" : false,
+    "configRequired" : false,
+    "configOptions" : null,
+    "configMin" : 1,
+    "configMax" : 600,
+    "configMaxLength" : null
+  }, {
+    "key" : "holdLoop",
+    "valueType" : "number",
+    "defaultValue" : 17,
+    "configTitle" : "HoldLoopTitle",
+    "configPrompt" : "HoldLoopPrompt",
+    "configType" : "numeric",
+    "configError" : null,
+    "configHelpUrl" : null,
+    "configReadonly" : false,
+    "configRequired" : false,
+    "configOptions" : null,
+    "configMin" : 1,
+    "configMax" : 600,
+    "configMaxLength" : null
+  }, {
+    "key" : "maxLoops",
+    "valueType" : "number",
+    "defaultValue" : 27,
+    "configTitle" : "MaxLoopsTitle",
+    "configPrompt" : "MaxLoopsPrompt",
+    "configType" : "numeric",
+    "configError" : null,
+    "configHelpUrl" : null,
+    "configReadonly" : false,
+    "configRequired" : false,
+    "configOptions" : null,
+    "configMin" : 1,
+    "configMax" : 600,
+    "configMaxLength" : null
+  }, {
+    "key" : "loopMeters",
+    "valueType" : "number",
+    "defaultValue" : 3000,
+    "configTitle" : "LoopMetersTitle",
+    "configPrompt" : "LoopMetersPrompt",
+    "configType" : "numeric",
+    "configError" : null,
+    "configHelpUrl" : null,
+    "configReadonly" : false,
+    "configRequired" : false,
+    "configOptions" : null,
+    "configMin" : 1,
+    "configMax" : 100000,
+    "configMaxLength" : null
+  } ],
+  "supportsLiveValidation" : false,
+  "languages" : {
+    "valyrian" : {
+      "FirstLoopMinTitle" : "First loop minutes",
+      "HoldLoopTitle" : "Hold loop",
+      "MaxLoopsPrompt" : "Total number of loops to plan for (default 27).",
+      "FirstLoopMinPrompt" : "Length of loop 1 in minutes (default 30).",
+      "HoldLoopPrompt" : "Loop number at which the pace floor is reached and stays (default 17).",
+      "MaxLoopsTitle" : "Max loops",
+      "LoopMetersTitle" : "Loop distance (m)",
+      "LoopMetersPrompt" : "Length of one loop in meters (default 3000).",
+      "AppName" : "Frontyard Loop Timer"
+    }
+  }
+}
