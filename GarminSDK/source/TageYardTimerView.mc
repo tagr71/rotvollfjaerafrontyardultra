@@ -6,23 +6,31 @@ using Toybox.Math;
 using Toybox.System;
 using Toybox.WatchUi;
 
-// Full-screen Connect IQ data field for Rotvollfjæra Frontyard Ultra.
+// Full-screen Connect IQ data field — "Tage Yard Timer".
+// Works for both Frontyard-style events (shrinking loop times) and standard
+// Backyard ultras (fixed loop time + distance). All values are derived from
+// activity elapsed time and elapsed distance.
 //
 // Layout (top to bottom, all inside a green countdown donut):
-//   n/max                       (loop counter; PINK at 10, GREEN at 15, else BLUE)
+//   n/max                       (loop counter; PINK at 10, GREEN at 15,
+//                                YELLOW on the final loop, else BLUE)
 //   MM:SS  |  min/km            (countdown in RED, target pace in BLUE)
 //   HH:MM:SS                    (real-time clock)
-//   bpm  |  km                  (current HR + current-loop distance, RED, XTINY)
-//   min/km                      (running-average pace, RED, TINY)
+//   bpm  +/-Nm  min/km          (HR, gap to pacer, running-avg pace; XTINY)
 //   HH:MM:SS                    (predicted start of next loop, hidden until start)
 //   next loop
 //
-// The donut's outer half is clipped by the bezel. Three blue markers on
-// the band mark the 3/2/1-minute-remaining positions. A white runner dot
-// rides the band, advancing one full lap per configured loop distance.
-// Plays escalating bell+vibrate alerts (3 beeps at 3 min, 2 at 2 min,
-// 1 at 1 min remaining).
-class FrontyardLoopTimerView extends WatchUi.DataField {
+// Around the donut: km labels (0.5, 1, 1.5, ...) mark distance progress;
+// the white runner dot rides the band, one full lap per configured
+// loop distance, and three blue markers sit at 3/2/1 min remaining.
+// A yellow pacer dot tracks the position a runner on perfect target pace
+// would have right now (advances with elapsed loop time). The white dot
+// is drawn on top of the yellow dot when they overlap.
+//
+// Alerts (bell + vibrate):
+//   * 3 beeps at 3 min remaining, 2 at 2 min, 1 at 1 min
+//   * 3 beeps + vibrate at every new-loop boundary and at race finish
+class TageYardTimerView extends WatchUi.DataField {
 
     // --- schedule ---
     private var _endsAtSec;          // Array<Number> cumulative end times in seconds
@@ -65,12 +73,17 @@ class FrontyardLoopTimerView extends WatchUi.DataField {
     }
 
     private function readNumber(key, fallback) {
-        var v = Application.Properties.getValue(key);
+        var v = null;
+        try {
+            v = Application.getApp().getProperty(key);
+        } catch (ex) {
+            return fallback;
+        }
         if (v == null) { return fallback; }
         if (v instanceof Lang.Number) { return v; }
-        if (v instanceof Lang.Float || v instanceof Lang.Double) { return v.toNumber(); }
+        if (v instanceof Lang.Float) { return v.toNumber(); }
         if (v instanceof Lang.String) {
-            try { return v.toNumber(); } catch (e) { return fallback; }
+            try { return v.toNumber(); } catch (ex2) { return fallback; }
         }
         return fallback;
     }
@@ -124,6 +137,9 @@ class FrontyardLoopTimerView extends WatchUi.DataField {
         }
 
         if (idx == -1) {
+            if (!_done) {
+                ringBell(3);
+            }
             _done               = true;
             _currentLoopNum     = _maxLoops;
             _timeToNext         = 0;
@@ -135,6 +151,11 @@ class FrontyardLoopTimerView extends WatchUi.DataField {
 
         var totalDist = info.elapsedDistance != null ? info.elapsedDistance : 0.0;
         if (idx != _currentLoopIdx) {
+            // New loop has started — alert at the loop boundary (skip initial
+            // entry where there is no previous loop yet).
+            if (_currentLoopIdx >= 0) {
+                ringBell(3);
+            }
             _currentLoopIdx      = idx;
             _prevTimeToNext      = -1;
             _distanceAtLoopStart = totalDist;
@@ -191,11 +212,11 @@ class FrontyardLoopTimerView extends WatchUi.DataField {
         var h  = dc.getHeight();
         var cx = w / 2;
 
-        // Outer progress donut: red arc that grows as the countdown shrinks;
-        // fully red when _timeToNext reaches 0. The stroke is drawn so that
-        // its outer half extends past the screen edge (and is clipped),
-        // leaving roughly 5 visible pixels flush with the bezel.
-        var ringPen = 20;
+        // Outer progress donut: green arc that grows as the countdown
+        // shrinks; fully closed when _timeToNext reaches 0. The stroke is
+        // drawn so its outer half extends past the screen edge (and is
+        // clipped), leaving roughly 5 visible pixels flush with the bezel.
+        var ringPen = 44;
         // For an even screen width like 260px, the geometric center sits at
         // 129.5, not 130. Using a Float center keeps the ring perfectly
         // concentric with the bezel and equally thick on every side.
@@ -243,19 +264,41 @@ class FrontyardLoopTimerView extends WatchUi.DataField {
             }
             dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
         }
-        dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
 
-        // White runner dot: rides clockwise around the donut, starting at the
-        // top (North). One full lap of the dot == one full loop distance
-        // (_loopMeters). It is a filled circle whose diameter matches the
-        // donut thickness, positioned so it sits in the middle of the
-        // visible blue band (the outer half of the donut is clipped by the
-        // bezel, so the visible mid-radius is roughly screenRadius - pen/4).
+        // Yellow pacer dot: a fictive runner moving at exactly the required
+        // average pace to finish the current loop right at the deadline.
+        // Its angular position around the donut tracks the elapsed fraction
+        // of the loop time (same band/size as the white runner dot).
+        // Drawn BEFORE the white runner so the white dot sits on top when
+        // the two coincide.
+        if (!_done && _loopDurSec > 0) {
+            var elapsedInLoopP = _loopDurSec - _timeToNext;
+            if (elapsedInLoopP < 0) { elapsedInLoopP = 0; }
+            var paceFrac = elapsedInLoopP.toFloat() / _loopDurSec.toFloat();
+            if (paceFrac > 1.0) { paceFrac = 1.0; }
+            var pTheta   = (90.0 - 360.0 * paceFrac) * Math.PI / 180.0;
+            var pDotRad  = ringPen / 4;
+            var pRunnerR = (w < h ? w : h) / 2 - ringPen / 4;
+            var px       = ringCx + (pRunnerR * Math.cos(pTheta)).toNumber();
+            var py       = ringCy - (pRunnerR * Math.sin(pTheta)).toNumber();
+            dc.setColor(Graphics.COLOR_BLACK, Graphics.COLOR_TRANSPARENT);
+            dc.fillCircle(px, py, pDotRad + 2);
+            dc.setColor(Graphics.COLOR_YELLOW, Graphics.COLOR_TRANSPARENT);
+            dc.fillCircle(px, py, pDotRad);
+            dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
+        }
+
+        // White runner dot: rides clockwise around the donut, starting at
+        // the top (North). One full lap of the dot == one full loop distance
+        // (_loopMeters). It sits in the middle of the visible band (the
+        // outer half of the donut is clipped by the bezel, so the visible
+        // mid-radius is roughly screenRadius - pen/4). Drawn AFTER the
+        // yellow pacer dot so the white dot is on top when they overlap.
         if (!_done && _loopMeters > 0) {
             var lapFrac = _loopDistanceM / _loopMeters.toFloat();
             lapFrac = lapFrac - Math.floor(lapFrac);
             var theta = (90.0 - 360.0 * lapFrac) * Math.PI / 180.0;
-            var dotRad = ringPen / 2;
+            var dotRad = ringPen / 4;
             var runnerR = (w < h ? w : h) / 2 - ringPen / 4;
             var gx    = ringCx + (runnerR * Math.cos(theta)).toNumber();
             var gy    = ringCy - (runnerR * Math.sin(theta)).toNumber();
@@ -269,17 +312,14 @@ class FrontyardLoopTimerView extends WatchUi.DataField {
         var loopStr;
         var timeStr;
         var paceStr;
-        var distStr;
         if (_done) {
             loopStr = "DONE " + _maxLoops.toString();
             timeStr = "--:--";
             paceStr = "--:--";
-            distStr = "--";
         } else {
             loopStr = _currentLoopNum.toString() + "/" + _maxLoops.toString();
             timeStr = formatMmSs(_timeToNext);
             paceStr = formatPace(_targetPaceMinPerKm);
-            distStr = (_loopDistanceM / 1000.0).format("%.2f");
         }
 
         // Real-time clock (HH:MM:SS) and predicted start of next loop (HH:MM).
@@ -300,7 +340,7 @@ class FrontyardLoopTimerView extends WatchUi.DataField {
 
         // Use system fonts that scale per-device; pick conservative sizes.
         var fTiny    = Graphics.FONT_XTINY;
-        var fSmall   = Graphics.FONT_SMALL;         // Next time
+        var fSmall   = Graphics.FONT_TINY;          // Next-loop time (smaller)
         var fBig     = Graphics.FONT_LARGE;         // loop counter (n/max)
         var fClock   = Graphics.FONT_NUMBER_MILD;   // clock
         var fHero    = Graphics.FONT_LARGE;         // countdown + pace
@@ -310,41 +350,53 @@ class FrontyardLoopTimerView extends WatchUi.DataField {
         var hBig    = Graphics.getFontHeight(fBig);
         var hClock  = Graphics.getFontHeight(fClock);
         var hHero   = Graphics.getFontHeight(fHero);
-        var hAvgRow = Graphics.getFontHeight(Graphics.FONT_TINY);
         var hHrRow  = Graphics.getFontHeight(Graphics.FONT_XTINY);
 
-        // Vertical stack: loop / countdown+clock / pace / Next.
-        var gapLoop  = 10; // gap below loop row
-        var gapHero  = 4;  // gap below countdown/clock row
-        var gapNext  = 0;  // gap above Next row
-        var loopOffsetY = 14;  // nudge loop counter below donut crown
-        var contentH =
-              loopOffsetY + hBig           // loop row (with offset)
-            + gapLoop + hHero              // countdown + pace (with unit overlap)
-            + gapHero + hClock + hHrRow + hAvgRow   // clock + hr + avg pace / distance
-            + gapNext + hSmall + hTiny;    // next time + "next loop" label
+        // Vertical stack with equidistant gaps between five rows:
+        //   loop / countdown+pace / clock / hr+avg pace / next loop
+        //
+        // The top of the loop row and the bottom of the "next loop" label
+        // are inset from the screen edges so they stay clear of the donut
+        // ring (pen ~ringPen, visible band ~ringPen/2 from each edge).
+        var donutInset = ringPen / 2 + 6;  // a few px of breathing room
 
-        var yTop = (h - contentH) / 2;
-        if (yTop < 2) { yTop = 2; }
+        // Effective row heights, accounting for sublabels that hang below
+        // their primary text on the hero and "next loop" rows.
+        var hHeroRow = hHero - 9 + hTiny;        // hero number + tiny sublabel
+        if (hHeroRow < hHero) { hHeroRow = hHero; }
+        var hNextRow = hSmall - 2 + hTiny;       // "next" number + tiny sublabel
+        if (hNextRow < hSmall) { hNextRow = hSmall; }
+
+        var sumRows = hBig + hHeroRow + hClock + hHrRow + hNextRow;
+        var avail   = h - 2 * donutInset;
+        var gap     = (avail - sumRows) / 4;
+        if (gap < 0) { gap = 0; }
+
+        var gapLoop = gap;   // gap below loop row
+        var gapHero = gap;   // gap below countdown/pace row
+        var gapClk  = gap;   // gap below clock row
+        var gapHr   = gap;   // gap below hr/avg-pace row (above "next loop")
+
+        var yTop = donutInset;
 
         // Color the loop counter: PINK at loop 10, GREEN at loop 15,
-        // BLUE otherwise.
+        // YELLOW at the final loop, BLUE otherwise.
         var loopColor = Graphics.COLOR_BLUE;
         if (!_done) {
-            if (_currentLoopNum == 10) {
+            if (_currentLoopNum == _maxLoops) {
+                loopColor = Graphics.COLOR_YELLOW;
+            } else if (_currentLoopNum == 10) {
                 loopColor = Graphics.COLOR_PINK;
             } else if (_currentLoopNum == 15) {
                 loopColor = Graphics.COLOR_GREEN;
             }
         }
         dc.setColor(loopColor, Graphics.COLOR_TRANSPARENT);
-        // Nudge the loop counter slightly below the top crown of the donut
-        // so the green ring doesn't crowd the digits.
-        dc.drawText(cx, yTop + loopOffsetY, fBig, loopStr, Graphics.TEXT_JUSTIFY_CENTER);
+        dc.drawText(cx, yTop, fBig, loopStr, Graphics.TEXT_JUSTIFY_CENTER);
         dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
 
         // Row: countdown (left) and target pace (right), below loop row.
-        var yTime    = yTop + loopOffsetY + hBig + gapLoop;
+        var yTime    = yTop + hBig + gapLoop;
 
         var col1X = w * 0.30;  // countdown
         var col2X = w * 0.70;  // pace
@@ -360,37 +412,113 @@ class FrontyardLoopTimerView extends WatchUi.DataField {
         var yClock = yTime + hHero + gapHero;
         dc.drawText(cx, yClock, fClock, clockStr, Graphics.TEXT_JUSTIFY_CENTER);
 
-        // Bottom block: HR + current-loop distance share one XTINY row,
-        // running-average pace sits centered just below.
-        var fAvg        = Graphics.FONT_TINY;
-        var hAvg        = hAvgRow;
+        // Bottom block: HR + gap-to-pacer + running-average pace grouped on
+        // one XTINY row, then horizontally centered as a single unit.
+        //
+        // The gap is the signed distance (in meters) between the white
+        // runner dot (actual position in the current loop) and the yellow
+        // pacer dot (position of a runner on the required average pace).
+        //   gap > 0  -> ahead of pace (GREEN)
+        //   gap < 0  -> behind pace   (RED)
+        //   gap == 0 -> on pace
         var avgValueStr = _avgPaceMinPerKm > 0.0 ? formatPace(_avgPaceMinPerKm) : "--:--";
         var avgFullStr  = avgValueStr + " min/km";
-        var distFullStr = distStr + " km";
+
+        var gapMeters = 0;
+        var haveGap   = false;
+        if (!_done && _loopDurSec > 0 && _loopMeters > 0) {
+            var elapsedInLoopG = _loopDurSec - _timeToNext;
+            if (elapsedInLoopG < 0) { elapsedInLoopG = 0; }
+            var pacerDistM = (elapsedInLoopG.toFloat() / _loopDurSec.toFloat())
+                             * _loopMeters.toFloat();
+            gapMeters = (_loopDistanceM - pacerDistM).toNumber();
+            haveGap   = true;
+        }
+        var gapStr;
+        if (!haveGap) {
+            gapStr = "--m";
+        } else if (gapMeters > 0) {
+            gapStr = "+" + gapMeters.toString() + "m";
+        } else {
+            gapStr = gapMeters.toString() + "m"; // negative sign included
+        }
+        var gapColor;
+        if (!haveGap) {
+            gapColor = fg;
+        } else if (gapMeters > 0) {
+            gapColor = Graphics.COLOR_GREEN;
+        } else if (gapMeters < 0) {
+            gapColor = Graphics.COLOR_RED;
+        } else {
+            gapColor = fg;
+        }
 
         var fHr        = Graphics.FONT_XTINY;
         var hHr        = Graphics.getFontHeight(fHr);
         var hrStr      = (_currentHr > 0 ? _currentHr.toString() : "--") + " bpm";
-        var bottomShiftUp = 8;
-        var yHrLine    = yClock + hClock - bottomShiftUp;
-        var gapHrDist  = 12;
-        var wHrTxt     = dc.getTextWidthInPixels(hrStr,       fHr);
-        var wDistTxt   = dc.getTextWidthInPixels(distFullStr, fHr);
-        var hrStartX   = (w - (wHrTxt + gapHrDist + wDistTxt)) / 2;
+        var yHrLine    = yClock + hClock + gapClk;
+        var gapHrAvg   = 10;
+        var wHrTxt     = dc.getTextWidthInPixels(hrStr,      fHr);
+        var wGapTxt    = dc.getTextWidthInPixels(gapStr,     fHr);
+        var wAvgTxt    = dc.getTextWidthInPixels(avgFullStr, fHr);
+        var totalW     = wHrTxt + gapHrAvg + wGapTxt + gapHrAvg + wAvgTxt;
+        var hrStartX   = (w - totalW) / 2;
+        var gapStartX  = hrStartX + wHrTxt + gapHrAvg;
+        var avgStartX  = gapStartX + wGapTxt + gapHrAvg;
         dc.setColor(Graphics.COLOR_RED, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(hrStartX,                      yHrLine, fHr, hrStr,       Graphics.TEXT_JUSTIFY_LEFT);
-        dc.drawText(hrStartX + wHrTxt + gapHrDist, yHrLine, fHr, distFullStr, Graphics.TEXT_JUSTIFY_LEFT);
-
-        var yTinyLine  = yHrLine + hHr;
-        dc.drawText(cx, yTinyLine, fAvg, avgFullStr, Graphics.TEXT_JUSTIFY_CENTER);
+        dc.drawText(hrStartX,  yHrLine, fHr, hrStr,      Graphics.TEXT_JUSTIFY_LEFT);
+        dc.setColor(gapColor,  Graphics.COLOR_TRANSPARENT);
+        dc.drawText(gapStartX, yHrLine, fHr, gapStr,     Graphics.TEXT_JUSTIFY_LEFT);
+        dc.setColor(Graphics.COLOR_RED, Graphics.COLOR_TRANSPARENT);
+        dc.drawText(avgStartX, yHrLine, fHr, avgFullStr, Graphics.TEXT_JUSTIFY_LEFT);
         dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
 
         // Predicted start time of next loop (hidden until the activity has
         // actually been started).
         if (_started) {
-            var yNext = yClock + hClock + hHr + hAvg + gapNext - bottomShiftUp;
+            var yNext = yHrLine + hHr + gapHr;
+            dc.setColor(Graphics.COLOR_BLUE, Graphics.COLOR_TRANSPARENT);
             dc.drawText(cx, yNext, fSmall, nextStr, Graphics.TEXT_JUSTIFY_CENTER);
-            dc.drawText(cx, yNext + hSmall - 3, fTiny, "next loop", Graphics.TEXT_JUSTIFY_CENTER);
+            dc.drawText(cx, yNext + hSmall - 2, fTiny, "next loop", Graphics.TEXT_JUSTIFY_CENTER);
+            dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
+        }
+
+        // Distance km labels drawn LAST so they sit on top of the donut and
+        // runner dot -- always visible. The label step adapts to the loop
+        // length so they stay legible for both short (3 km) and long
+        // (6.7 km backyard) loops.
+        if (!_done && _loopMeters > 0) {
+            var stepM;
+            if (_loopMeters <= 3500) {
+                stepM = 500;
+            } else if (_loopMeters <= 12000) {
+                stepM = 1000;
+            } else {
+                stepM = 2000;
+            }
+            var screenR    = (w < h ? w : h) / 2;
+            var bandR      = screenR - ringPen / 4;
+            var fLabelFb   = Graphics.FONT_XTINY;
+            var hLabelFb   = Graphics.getFontHeight(fLabelFb);
+            var labelR     = bandR;
+
+            for (var dM = stepM; dM < _loopMeters; dM += stepM) {
+                var label  = stepM < 1000
+                           ? (dM / 1000.0).format("%.1f")
+                           : (dM / 1000).toString();
+                var tFrac  = dM.toFloat() / _loopMeters.toFloat();
+                var degCcw = 90.0 - 360.0 * tFrac;
+                var tTheta = degCcw * Math.PI / 180.0;
+                var cosT   = Math.cos(tTheta);
+                var sinT   = Math.sin(tTheta);
+
+                var lx = ringCx + (labelR * cosT).toNumber();
+                var ly = ringCy - (labelR * sinT).toNumber();
+                dc.setColor(Graphics.COLOR_BLACK, Graphics.COLOR_TRANSPARENT);
+                dc.drawText(lx, ly - hLabelFb / 2, fLabelFb, label,
+                            Graphics.TEXT_JUSTIFY_CENTER);
+            }
+            dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
         }
     }
 
