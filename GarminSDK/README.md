@@ -29,8 +29,13 @@ A green countdown donut around the bezel and, inside it, top to bottom:
 - **`min/km`** (blue, right) — required pace for the loop,
   with a tiny `min/km` label.
 - **`HH:MM:SS`** — current clock time (24h).
-- **`bpm` + `km`** (red, small) — current heart rate and distance
-  covered in the current loop.
+- **`MM:SS br`** (blue, small) — projected **break** time you would
+  rest before the next loop starts if you run the remaining loop
+  distance at your current running-average pace. Shows `--:-- br`
+  before there is enough data or when projected to miss the cutoff.
+- **`±Nm`** (small) — signed metres between the white runner dot and
+  the yellow pacer dot. **Green** when ahead, **red** when behind,
+  forced to `0m` at the start and final second of every loop.
 - **`min/km`** (red) — running average pace.
 - **`HH:MM:SS` + `next loop`** — predicted clock time when the next loop
   starts (hidden until the activity timer is running).

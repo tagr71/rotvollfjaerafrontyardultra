@@ -1,7 +1,7 @@
 using Toybox.Application;
 using Toybox.WatchUi;
 
-class FrontyardLoopTimerApp extends Application.AppBase {
+class TageYardTimerApp extends Application.AppBase {
 
     private var _view;
 
@@ -16,7 +16,7 @@ class FrontyardLoopTimerApp extends Application.AppBase {
     }
 
     function getInitialView() {
-        _view = new FrontyardLoopTimerView();
+        _view = new TageYardTimerView();
         return [ _view ];
     }
 

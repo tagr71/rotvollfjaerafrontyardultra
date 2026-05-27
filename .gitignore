@@ -14,3 +14,8 @@ dist/
 .DS_Store
 .vscode/*
 !.vscode/extensions.json
+
+# Garmin Connect IQ build output
+GarminSDK/bin/
+GarminSDK/my-garmin-app/bin/
+
