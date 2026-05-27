@@ -427,12 +427,21 @@ class TageYardTimerView extends WatchUi.DataField {
         var gapMeters = 0;
         var haveGap   = false;
         if (!_done && _loopDurSec > 0 && _loopMeters > 0) {
-            var elapsedInLoopG = _loopDurSec - _timeToNext;
-            if (elapsedInLoopG < 0) { elapsedInLoopG = 0; }
-            var pacerDistM = (elapsedInLoopG.toFloat() / _loopDurSec.toFloat())
-                             * _loopMeters.toFloat();
-            gapMeters = (_loopDistanceM - pacerDistM).toNumber();
-            haveGap   = true;
+            if (_loopDistanceM <= 0.0 || _timeToNext <= 1) {
+                // Force the gap to exactly 0 m at both ends of the loop:
+                //   * right after a new loop starts (runner hasn't moved
+                //     yet in this loop), and
+                //   * in the final second of the loop, i.e. when the loop
+                //     ends on time.
+                gapMeters = 0;
+            } else {
+                var elapsedInLoopG = _loopDurSec - _timeToNext;
+                if (elapsedInLoopG < 0) { elapsedInLoopG = 0; }
+                var pacerDistM = (elapsedInLoopG.toFloat() / _loopDurSec.toFloat())
+                                 * _loopMeters.toFloat();
+                gapMeters = (_loopDistanceM - pacerDistM).toNumber();
+            }
+            haveGap = true;
         }
         var gapStr;
         if (!haveGap) {
