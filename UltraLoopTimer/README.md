@@ -86,17 +86,22 @@ Runner dots on the ring:
 
 | Dot | Color | Meaning | Pace |
 |-----|-------|---------|------|
-| Real runner | **blue** | static at `completedLoops mod loopsPerCircle`; advances on lap press | from lap presses |
-| Fictive 1   | **green** | fastest pacer | 4:05 min/km |
-| Fictive 2   | **red**   | slowest pacer | 4:35 min/km |
+| Real runner | **blue** | slides smoothly within the current loop based on the previous loop's measured pace; **stops at the next tick** if the lap button is not pressed in time and resumes from there on the press | from lap presses |
+| Fictive 1   | **green** | fastest pacer | `raceSec / fastRunnerKm` (default 4:05 /km from 88 km in 6 h) |
+| Fictive 2   | **red**   | slowest pacer | `raceSec / slowRunnerKm` (default 4:30 /km from 80 km in 6 h) |
+
+A third **yellow** pacer is computed (midpoint of green and red) but
+has no dot on the ring. Its pace is used for (a) the first-loop slide
+estimate of the blue actual runner before any lap press, and (b) the
+silent every-loop crew vibe.
 
 Each dot has its **completed-loop count drawn in black** on top of the
 colored dot (readable on any face). Small **blue lap markers** sit on
 the ring for each loop the runner has completed in the current window
 (they reset when the window advances).
 
-A gentle vibe fires every simulated **4:20 min/km** loop — a passive
-"you are at target pace" cue for the crew.
+A gentle vibe fires every **yellow-pace loop** — a passive
+"runner is at midpoint pace" cue for the crew.
 
 Inside the ring (top to bottom), using fg for text rows that should
 adapt to background:
@@ -113,7 +118,7 @@ adapt to background:
 
 ## Lap-press correction (support mode)
 
-Within a sliding window of `correctionWindowSec` seconds (default 5 s)
+Within a sliding window of `correctionWindowSec` seconds (default 10 s)
 each lap-button press joins a "burst". When the window expires the
 burst is finalized:
 
@@ -126,6 +131,19 @@ burst is finalized:
 Each individual press also fires one short bell so the operator knows
 the press was registered.
 
+## Carb / fueling alert (support mode)
+
+A scheduled-serving model: every hour is split into
+`carbServingsPerHour` evenly-spaced servings of
+`carbsPerHourGrams / carbServingsPerHour` grams each.
+
+When the next scheduled serving is due **and** the next estimated
+loop end is within `carbServingAlarmSec` seconds, an orange `FUEL Ng`
+pill is drawn below the countdown and a 2-bell + 2-vibe alert fires
+once. The pill stays on screen until the next lap-button press
+(normal or double press), which counts the serving as taken and clears
+the pill. An *undo* burst does **not** cancel an already-served carb.
+
 ## Other alerts (support mode)
 
 - **1 minute remaining** — 1 beep + 1 buzz
@@ -136,13 +154,18 @@ the press was registered.
 In Garmin Connect → Connect IQ Apps → *UltraLoopTimer* or
 *UltraLoop Support* → Settings:
 
-| Key | Runner default | Support default | Meaning |
-|-----|----------------|-----------------|---------|
-| `supportMode`         | `false` | `true` | `true` = crew pacer view, `false` = runner view |
-| `raceHours`           | 6       | 6     | Race duration in hours (any integer 1–72) |
-| `loopMeters`          | 1185.6  | 1185.6 | Length of one loop in meters |
-| `loopsPerCircle`      | 8       | 8     | Loops per full ring revolution (1–50) |
-| `correctionWindowSec` | 5       | 5     | Lap-burst window in seconds (1–10) |
+| Key | Default | Range | Meaning |
+|-----|---------|-------|---------|
+| `supportMode`          | runner: `false`, support: `true` | bool | `true` = crew pacer view, `false` = runner view |
+| `raceHours`            | 6       | 6 / 12 / 24 | Race duration in hours |
+| `loopMeters`           | 1185.6  | 1 – 100000 | Length of one loop in meters |
+| `loopsPerCircle`       | 8       | 1 – 50    | Loops per full ring revolution |
+| `correctionWindowSec`  | 10      | 1 – 20    | Lap-burst window in seconds |
+| `fastRunnerKm`         | 88      | 1 – 500   | GREEN pacer's total race-distance goal (km); pace = `raceSec / km` |
+| `slowRunnerKm`         | 80      | 1 – 500   | RED pacer's total race-distance goal (km); clamped ≤ `fastRunnerKm` |
+| `carbsPerHourGrams`    | 90      | 0 – 200   | Total grams of carbs per hour |
+| `carbServingsPerHour`  | 6       | 1 – 30    | Servings per hour (so each serving = `grams / servings`) |
+| `carbServingAlarmSec`  | 60      | 10 – 600  | Lead time before the next estimated loop end at which the FUEL alarm fires |
 
 The per-app `supportMode` defaults live in
 `resources-runner-default/settings/properties.xml` and
@@ -209,9 +232,11 @@ and pace move you need to feed the simulator activity data:
 input it correctly shows `0:00 /km`, `0:00 /lp`, `avg 0:00 /lp` and
 `0.00 km`.
 
-Support mode auto-advances the blue actual-runner dot at the simulated
-yellow pace (4:20/km) so it lines up with the green / red pacer
-positions over time.
+Support mode also requires the simulator activity timer to be running
+(so `elapsedTime` ticks) for the green/red fictive pacer dots to move
+and for the blue actual-runner dot to slide between lap presses. Use
+the sim's lap-button shortcut to advance the blue dot to the next
+tick.
 
 ## Status
 
@@ -221,10 +246,14 @@ positions over time.
   window, strictly GPS-driven, fully silent. Text colors auto-adapt to
   the data-field background.
 - **Support mode** (default for `UltraLoop Support`): pacer-dot ring
-  (green + red), static blue runner that advances on lap press, in-dot
-  loop counts, fastest-of-{blue,green} window advance, loop/avg/
-  projection stats, lap-burst correction, silent every-loop crew vibe
-  at 4:20/km. Text rows also auto-adapt to background.
+  (green + red, paces derived from `fastRunnerKm` / `slowRunnerKm` and
+  `raceHours`), blue actual-runner dot that **slides within the
+  current loop** at the previous loop's pace and waits at the next
+  tick until the lap button is pressed, in-dot loop counts,
+  fastest-of-{blue,green} window advance, loop/avg/projection stats,
+  lap-burst correction, scheduled-carb FUEL alarm, and a silent
+  every-loop crew vibe at the midpoint (yellow) pace. Text rows also
+  auto-adapt to background.
 - Supported devices: **fenix 7X**, **Forerunner 965**. Add more by
   appending `<iq:product id="..."/>` lines in both manifests once the
   layout has been verified on the target screen size.

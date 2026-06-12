@@ -12,16 +12,26 @@ module Rez {
     module Strings {
         (:initialized) var AppNameSupport as ResourceId;
         (:initialized) var CorrectionWindowTitle as ResourceId;
+        (:initialized) var CarbServingAlarmTitle as ResourceId;
         (:initialized) var ModeTitle as ResourceId;
+        (:initialized) var FastRunnerKmTitle as ResourceId;
+        (:initialized) var ModePrompt as ResourceId;
+        (:initialized) var LoopMetersTitle as ResourceId;
+        (:initialized) var CarbsGramsTitle as ResourceId;
+        (:initialized) var AppName as ResourceId;
+        (:initialized) var CarbServingsPrompt as ResourceId;
         (:initialized) var LoopsPerCircleTitle as ResourceId;
         (:initialized) var RaceHoursTitle as ResourceId;
         (:initialized) var RaceHoursPrompt as ResourceId;
+        (:initialized) var FastRunnerKmPrompt as ResourceId;
         (:initialized) var LoopsPerCirclePrompt as ResourceId;
-        (:initialized) var ModePrompt as ResourceId;
-        (:initialized) var LoopMetersTitle as ResourceId;
+        (:initialized) var SlowRunnerKmTitle as ResourceId;
+        (:initialized) var CarbServingAlarmPrompt as ResourceId;
         (:initialized) var LoopMetersPrompt as ResourceId;
-        (:initialized) var AppName as ResourceId;
+        (:initialized) var SlowRunnerKmPrompt as ResourceId;
         (:initialized) var CorrectionWindowPrompt as ResourceId;
+        (:initialized) var CarbsGramsPrompt as ResourceId;
+        (:initialized) var CarbServingsTitle as ResourceId;
     } // Strings
 
     module Styles {

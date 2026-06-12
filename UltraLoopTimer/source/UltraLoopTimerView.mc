@@ -7,12 +7,20 @@ using Toybox.System;
 using Toybox.WatchUi;
 
 // Fictive runner paces (sec/km): GREEN fastest, RED slowest.
-// The yellow pacer was removed from the display but its pace is kept
-// as YELLOW_SEC_PER_KM for (a) auto-advancing the simulated blue
-// runner in support sim mode and (b) the silent every-loop crew vibe.
-var FICTIVE_PACES_SEC_PER_KM = [245, 275];
-var FICTIVE_PACE_LABELS      = ["4:05", "4:35"];
-const YELLOW_SEC_PER_KM = 260;
+// Derived from the user-configured per-runner goal distance (km) and
+// race duration (raceHours): paceSecPerKm = raceSec / goalKm. Updated
+// in rebuildSchedule() whenever the settings change.
+//
+// The yellow pacer has no dot on the ring. Its pace is kept as
+// YELLOW_SEC_PER_KM (always the midpoint of GREEN and RED) and used
+// for two passive purposes:
+//   (a) first-loop pace estimate for the sliding blue actual-runner
+//       dot in support mode (before any lap press provides a real
+//       measured loop time),
+//   (b) the silent every-loop crew vibe.
+var FICTIVE_PACES_SEC_PER_KM = [245, 270];
+var FICTIVE_PACE_LABELS      = ["4:05", "4:30"];
+var YELLOW_SEC_PER_KM = 258;
 
 // Full-screen Connect IQ data field for fixed-duration "timed" ultras
 // (6 / 12 / 24 hour events) on a fixed loop course.
@@ -22,8 +30,11 @@ const YELLOW_SEC_PER_KM = 260;
 //              loop count (the support presses the lap button on each
 //              completed loop) times the configured loop length.
 //              Displays a sliding window of _loopsPerCircle loop ticks
-//              with two fictive pacers (green/red), the blue
-//              actual runner dot, lap-pace stats and a finish projection.
+//              with two fictive pacers (green/red) and the blue actual
+//              runner dot, which slides smoothly inside the current
+//              loop based on the previous loop's measured pace and
+//              stops at the next tick if the lap button is not pressed
+//              in time. Plus lap-pace stats and a finish projection.
 //   runner   - silent runner view. Distance comes from GPS
 //              (info.elapsedDistance). Shows a single blue dot sliding
 //              around the same _loopsPerCircle window plus a text
@@ -40,11 +51,11 @@ const YELLOW_SEC_PER_KM = 260;
 //   * lap-press feedback (see above)
 //   * 1 beep at 1 minute remaining
 //   * 3 beeps at race finish
-//   * gentle vibe every simulated yellow-pace (4:20/km) loop
+//   * gentle vibe every yellow-pace (midpoint of green/red) loop
 class UltraLoopTimerView extends WatchUi.DataField {
 
     // --- config ---
-    private var _supportMode;        // true = support/crew view (no HR/pace)
+    private var _supportMode;        // true = support/crew view, false = runner view
     private var _raceSec;            // total race duration in seconds
     private var _loopMeters;         // Float; meters per loop
     private var _loopsPerCircle;     // how many fastest-runner loops fill one ring revolution
@@ -65,8 +76,16 @@ class UltraLoopTimerView extends WatchUi.DataField {
     private var _prevTimeToFinish;   // for 1-minute threshold detection
     private var _burstStartSec;      // elapsedSec at first press of current burst (-1 if none)
     private var _burstCount;         // number of lap presses in the current burst
-    private var _yellowLoopsDone;    // integer loops the yellow fictive runner has finished
+    private var _yellowLoopsDone;    // integer loops the yellow pacer has finished (drives crew vibe)
     private var _liveLoopSec;        // current loop's instantaneous duration (sec); 0 when n/a
+
+    // --- carb / fueling alert (support mode) ---
+    private var _carbsPerHourGrams;     // grams of carbs per hour (config)
+    private var _carbServingsPerHour;   // number of servings per hour (config)
+    private var _carbsIntervalSec;      // seconds between scheduled servings
+    private var _carbServingAlarmSec;   // lead-time before next loop end to fire alarm (config)
+    private var _carbsGiven;            // number of servings already acknowledged
+    private var _carbDueShow;           // true = icon is currently shown, waiting for lap press
 
     function initialize() {
         DataField.initialize();
@@ -87,6 +106,12 @@ class UltraLoopTimerView extends WatchUi.DataField {
         _burstCount         = 0;
         _yellowLoopsDone    = 0;
         _liveLoopSec        = 0;
+        _carbsPerHourGrams    = 90;
+        _carbServingsPerHour  = 6;
+        _carbsIntervalSec   = 600;
+        _carbServingAlarmSec = 60;
+        _carbsGiven         = 0;
+        _carbDueShow        = false;
         rebuildSchedule();
     }
 
@@ -120,6 +145,8 @@ class UltraLoopTimerView extends WatchUi.DataField {
         _burstStartSec      = -1;
         _burstCount         = 0;
         _yellowLoopsDone    = 0;
+        _carbsGiven         = 0;
+        _carbDueShow        = false;
     }
 
     // Apply the accumulated burst once its window has expired.
@@ -132,8 +159,12 @@ class UltraLoopTimerView extends WatchUi.DataField {
 
         if (n <= 2) {
             // Positive correction: 1 = normal lap, 2 = +1 missed lap caught.
-            var loopSec = startSec - _lastLoopElapsedSec;
-            if (loopSec < 0) { loopSec = 0; }
+            // For a 2-press burst we record the *per-loop* time (interval
+            // since the previous lap divided by 2) so `pa` keeps reflecting
+            // a single loop, not the combined 2-loop interval.
+            var interval = startSec - _lastLoopElapsedSec;
+            if (interval < 0) { interval = 0; }
+            var loopSec  = (n == 2) ? (interval / 2) : interval;
             _prevLoopElapsedSec = _lastLoopElapsedSec;
             _lastLoopSec        = loopSec;
             _lastLoopElapsedSec = startSec;
@@ -147,6 +178,25 @@ class UltraLoopTimerView extends WatchUi.DataField {
                 _lastLoopSec        = 0;
             }
             ringBell(1);
+        }
+
+        // Refresh the average so avg pa updates on each lap press only.
+        if (_completedLoops > 0 && _lastLoopElapsedSec > 0) {
+            _avgLoopSec      = (_lastLoopElapsedSec.toFloat()
+                              / _completedLoops.toFloat()).toNumber();
+            _avgPaceMinPerKm = loopSecToPaceMinPerKm(_avgLoopSec);
+        } else {
+            _avgLoopSec      = 0;
+            _avgPaceMinPerKm = 0.0;
+        }
+
+        // If the FUEL icon was on screen waiting for a lap-press
+        // acknowledgement, clear it and count the serving as taken.
+        // (Both single-lap and double-lap presses count; an undo does
+        // not cancel an already-served carb.)
+        if (_carbDueShow && n <= 2) {
+            _carbDueShow = false;
+            _carbsGiven += 1;
         }
     }
 
@@ -182,18 +232,6 @@ class UltraLoopTimerView extends WatchUi.DataField {
         return fallback;
     }
 
-    function readString(key, fallback) {
-        var v = null;
-        try {
-            v = Application.getApp().getProperty(key);
-        } catch (ex) {
-            return fallback;
-        }
-        if (v == null) { return fallback; }
-        if (v instanceof Lang.String) { return v; }
-        return v.toString();
-    }
-
     function readBool(key, fallback) {
         var v = null;
         try {
@@ -223,9 +261,43 @@ class UltraLoopTimerView extends WatchUi.DataField {
         if (_loopsPerCircle < 1)  { _loopsPerCircle = 1; }
         if (_loopsPerCircle > 50) { _loopsPerCircle = 50; }
 
-        _correctionWindowSec = readNumber("correctionWindowSec", 5);
+        _correctionWindowSec = readNumber("correctionWindowSec", 10);
         if (_correctionWindowSec < 1)  { _correctionWindowSec = 1; }
-        if (_correctionWindowSec > 10) { _correctionWindowSec = 10; }
+        if (_correctionWindowSec > 20) { _correctionWindowSec = 20; }
+
+        // Fictive pacer goal distances (km) -> per-km paces (sec/km).
+        // Fast (GREEN) must be >= slow (RED); we clamp if the user
+        // accidentally inverts them so GREEN is always the faster dot.
+        var fastKm = readFloat("fastRunnerKm", 88.0);
+        if (fastKm < 1.0)   { fastKm = 1.0; }
+        if (fastKm > 500.0) { fastKm = 500.0; }
+        var slowKm = readFloat("slowRunnerKm", 80.0);
+        if (slowKm < 1.0)   { slowKm = 1.0; }
+        if (slowKm > 500.0) { slowKm = 500.0; }
+        if (slowKm > fastKm) { slowKm = fastKm; }
+        var raceSecF = _raceSec.toFloat();
+        var fastSecPerKm = (raceSecF / fastKm).toNumber();
+        var slowSecPerKm = (raceSecF / slowKm).toNumber();
+        if (fastSecPerKm < 1) { fastSecPerKm = 1; }
+        if (slowSecPerKm < 1) { slowSecPerKm = 1; }
+        FICTIVE_PACES_SEC_PER_KM = [fastSecPerKm, slowSecPerKm];
+        FICTIVE_PACE_LABELS      = [formatSecPerKm(fastSecPerKm),
+                                    formatSecPerKm(slowSecPerKm)];
+        YELLOW_SEC_PER_KM = (fastSecPerKm + slowSecPerKm) / 2;
+        if (YELLOW_SEC_PER_KM < 1) { YELLOW_SEC_PER_KM = 1; }
+
+        _carbsPerHourGrams = readNumber("carbsPerHourGrams", 90);
+        if (_carbsPerHourGrams < 0)   { _carbsPerHourGrams = 0; }
+        if (_carbsPerHourGrams > 200) { _carbsPerHourGrams = 200; }
+
+        _carbServingsPerHour = readNumber("carbServingsPerHour", 6);
+        if (_carbServingsPerHour < 1)  { _carbServingsPerHour = 1; }
+        if (_carbServingsPerHour > 30) { _carbServingsPerHour = 30; }
+        _carbsIntervalSec = 3600 / _carbServingsPerHour;
+
+        _carbServingAlarmSec = readNumber("carbServingAlarmSec", 60);
+        if (_carbServingAlarmSec < 10)  { _carbServingAlarmSec = 10; }
+        if (_carbServingAlarmSec > 600) { _carbServingAlarmSec = 600; }
 
         _done = false;
     }
@@ -246,9 +318,9 @@ class UltraLoopTimerView extends WatchUi.DataField {
             finalizeBurst();
         }
 
-        // Vibrate once every time a simulated yellow-pace (4:20/km)
-        // loop completes. Silent (no tone) so it does not compete with
-        // the manual lap-press feedback.
+        // Vibrate once every time a yellow-pace loop (midpoint of the
+        // configured GREEN/RED pacers) completes. Silent (no tone) so
+        // it does not compete with the manual lap-press feedback.
         if (_supportMode && _loopMeters > 0 && _elapsedSec > 0) {
             var yellowLoopSec = YELLOW_SEC_PER_KM.toFloat()
                               * (_loopMeters.toFloat() / 1000.0);
@@ -261,47 +333,44 @@ class UltraLoopTimerView extends WatchUi.DataField {
             }
         }
 
-        // Mode-split simulation:
-        //   support : assume blue (actual) runner runs at YELLOW pace.
-        //             Auto-advance _completedLoops and stamp _lastLoopSec
-        //             on each simulated lap so loop / avg pace update.
-        //   runner  : distance comes from GPS (info.elapsedDistance).
-        //             Falls back to a dev-time 4:20/km simulation when
-        //             no GPS distance is available. Loop count is derived
+        // Mode-split sources of loop / distance state:
+        //   support : _completedLoops and _lastLoopSec come ONLY from
+        //             lap-button presses (see onTimerLap / finalizeBurst).
+        //             pa and avg pa therefore freeze between lap presses.
+        //   runner  : distance comes from GPS (info.elapsedDistance),
+        //             motion-gated on currentSpeed. Loop count is derived
         //             from distance.
         if (_supportMode) {
-            if (_loopMeters > 0 && _elapsedSec > 0) {
-                var simLoopSec = YELLOW_SEC_PER_KM.toFloat()
-                               * (_loopMeters.toFloat() / 1000.0);
-                if (simLoopSec > 0) {
-                    var simLoops = (_elapsedSec.toFloat() / simLoopSec).toNumber();
-                    while (_completedLoops < simLoops) {
-                        _completedLoops    += 1;
-                        _prevLoopElapsedSec = _lastLoopElapsedSec;
-                        _lastLoopElapsedSec = (_completedLoops.toFloat() * simLoopSec).toNumber();
-                        _lastLoopSec        = simLoopSec.toNumber();
-                    }
-                }
-            }
             _totalDistanceM = _completedLoops * _loopMeters;
         } else {
-            // Runner mode: strictly GPS-driven. When the watch is not
-            // moving (no elapsedDistance / no currentSpeed) distance,
-            // live loop and avg loop all stay at 0.
-            var distM = 0.0;
-            var d     = info.elapsedDistance;
-            if (d != null && d > 0) {
-                distM = d.toFloat();
-            }
-            _totalDistanceM = distM;
-            if (_loopMeters > 0) {
-                _completedLoops = (distM / _loopMeters).toNumber();
-                var sp = info.currentSpeed;
-                if (sp != null && sp > 0.1) {
-                    _liveLoopSec = (_loopMeters.toFloat() / sp.toFloat()).toNumber();
-                } else {
-                    _liveLoopSec = 0;
+            // Runner mode: strictly GPS-driven and motion-gated.
+            // We only trust info.elapsedDistance when info.currentSpeed
+            // reports actual motion (> 0.5 m/s ~= 1.8 km/h). This
+            // filters two real-world sources of false distance growth:
+            //   * GPS drift on a stationary watch (elapsedDistance
+            //     creeps up by a few meters even when not moving),
+            //   * the Connect IQ simulator's default activity data
+            //     source which keeps incrementing elapsedDistance once
+            //     the activity timer is started even with no input.
+            // When not moving, distance stays frozen at its last value
+            // (so it does not rewind after a real stop) and the live
+            // loop pace shows 0:00.
+            var sp     = info.currentSpeed;
+            var moving = (sp != null && sp > 0.5);
+            if (moving) {
+                var d = info.elapsedDistance;
+                if (d != null && d > 0) {
+                    _totalDistanceM = d.toFloat();
                 }
+                _liveLoopSec = (_loopMeters.toFloat() / sp.toFloat()).toNumber();
+            } else {
+                _liveLoopSec = 0;
+                // _totalDistanceM intentionally not modified - freeze it
+                // so a momentary GPS dropout / standstill does not zero
+                // out the runner's accumulated distance.
+            }
+            if (_loopMeters > 0) {
+                _completedLoops = (_totalDistanceM / _loopMeters).toNumber();
             }
         }
 
@@ -329,33 +398,58 @@ class UltraLoopTimerView extends WatchUi.DataField {
         _prevTimeToFinish = remaining;
         _timeToFinish     = remaining;
 
-        // Average loop time + derived avg pace + projected total distance.
-        // Projection = distance already covered + extrapolation over the
-        // REMAINING race time at the *current* loop pace. Current pace
-        // prefers the most recent completed loop (_lastLoopSec) so the
-        // projection reacts to slowing/speeding up; falls back to the
-        // running average when a fresh lap time is not yet available.
-        if (_completedLoops > 0 && elapsed > 0) {
-            _avgLoopSec      = (elapsed.toFloat() / _completedLoops.toFloat()).toNumber();
-            _avgPaceMinPerKm = loopSecToPaceMinPerKm(_avgLoopSec);
-            var curLoopSec   = _lastLoopSec > 0 ? _lastLoopSec : _avgLoopSec;
-            var doneKm       = _totalDistanceM.toFloat() / 1000.0;
-            var futureLoops  = curLoopSec > 0
-                             ? (remaining.toFloat() / curLoopSec.toFloat())
-                             : 0.0;
-            _projectedKm     = doneKm + (futureLoops * _loopMeters.toFloat()) / 1000.0;
-        } else {
-            _avgLoopSec      = 0;
-            _avgPaceMinPerKm = 0.0;
-            _projectedKm     = 0.0;
+        // Average loop time + projected total distance.
+        //   support : _avgLoopSec / _avgPaceMinPerKm are updated only in
+        //             finalizeBurst (i.e. on lap-button press). Do NOT
+        //             recompute per tick here, so pa / avg pa stay frozen
+        //             between laps.
+        //   runner  : derive avg from continuous distance so it is
+        //             available before the first full loop completes.
+        if (!_supportMode) {
+            if (_totalDistanceM > 0 && elapsed > 0) {
+                _avgLoopSec      = (elapsed.toFloat() * _loopMeters.toFloat()
+                                  / _totalDistanceM.toFloat()).toNumber();
+                _avgPaceMinPerKm = loopSecToPaceMinPerKm(_avgLoopSec);
+            } else {
+                _avgLoopSec      = 0;
+                _avgPaceMinPerKm = 0.0;
+            }
         }
 
-        // Runner mode: refine the avg from continuous distance so it is
-        // available before the first full loop completes.
-        if (!_supportMode && _totalDistanceM > 0 && elapsed > 0) {
-            _avgLoopSec      = (elapsed.toFloat() * _loopMeters.toFloat()
-                              / _totalDistanceM.toFloat()).toNumber();
-            _avgPaceMinPerKm = loopSecToPaceMinPerKm(_avgLoopSec);
+        // Projection updates every tick so it reacts to remaining time
+        // ticking down. Uses the running average loop pace (_avgLoopSec)
+        // so the estimate is based on the average pa over all completed
+        // loops, not the noisier last-loop pace.
+        if (_completedLoops > 0) {
+            var doneKm      = _totalDistanceM.toFloat() / 1000.0;
+            var futureLoops = _avgLoopSec > 0
+                            ? (remaining.toFloat() / _avgLoopSec.toFloat())
+                            : 0.0;
+            _projectedKm    = doneKm + (futureLoops * _loopMeters.toFloat()) / 1000.0;
+        } else {
+            _projectedKm    = 0.0;
+        }
+
+        // Carb / fueling alert (support mode only, race not finished,
+        // need at least one completed loop so we have a pace estimate).
+        // Trigger the icon when we are "due" for the next scheduled
+        // serving AND the next estimated loop end is within the
+        // configured lead time, so the support crew can have the
+        // serving ready as the runner comes through the loop. The icon
+        // stays on screen and the alert fires once until the lap is
+        // registered.
+        if (_supportMode && !_done && !_carbDueShow
+                && _carbServingsPerHour > 0 && _carbsIntervalSec > 0
+                && _completedLoops > 0 && _avgLoopSec > 0) {
+            var dueAt       = (_carbsGiven + 1) * _carbsIntervalSec;
+            var nextLoopEnd = _lastLoopElapsedSec + _avgLoopSec;
+            var secsToLoop  = nextLoopEnd - elapsed;
+            if (elapsed >= (dueAt - _carbServingAlarmSec)
+                    && secsToLoop >= 0 && secsToLoop <= _carbServingAlarmSec) {
+                _carbDueShow = true;
+                ringBell(2);
+                vibrateOnly(2);
+            }
         }
     }
 
@@ -395,11 +489,11 @@ class UltraLoopTimerView extends WatchUi.DataField {
             timeStr  = "00:00:00";
         } else {
             var doneKm = (_completedLoops * _loopMeters).toFloat() / 1000.0;
-            loopsStr = _completedLoops.toString() + " loops ("
+            loopsStr = _completedLoops.toString() + " ("
                      + doneKm.format("%.1f") + " km)";
             timeStr  = fmtHmsAlways(_timeToFinish);
         }
-        projStr = "proj " + (_projectedKm > 0.0 ? _projectedKm.format("%.1f") : "--.-") + " km";
+        projStr = "est " + (_projectedKm > 0.0 ? _projectedKm.format("%.1f") : "--.-") + " km";
 
         var clock    = System.getClockTime();
         var clockStr = clock.hour.format("%02d") + ":"
@@ -410,8 +504,8 @@ class UltraLoopTimerView extends WatchUi.DataField {
         var fSmall   = Graphics.FONT_TINY;
         var fLoops   = Graphics.FONT_SMALL;   // smaller than the rest for the loops row
         var fClock   = Graphics.FONT_SMALL;
-        var fHero    = Graphics.FONT_MEDIUM;  // countdown clock; smaller, plain text font
-        var fProj    = Graphics.FONT_LARGE;   // bigger black proj km row (plain text font)
+        var fHero    = Graphics.FONT_SMALL;   // countdown clock; small, plain text font
+        var fProj    = Graphics.FONT_SMALL;   // est km row (smaller than before)
 
         var hLoops   = Graphics.getFontHeight(fLoops);
         var hClock   = Graphics.getFontHeight(fClock);
@@ -419,42 +513,83 @@ class UltraLoopTimerView extends WatchUi.DataField {
         var hProj    = Graphics.getFontHeight(fProj);
         var hStat    = Graphics.getFontHeight(fSmall);
 
+        // Row order top -> bottom:
+        //   1) wall clock
+        //   2) pa + avg pa (stat row)
+        //   3) est km (projection)
+        //   4) loops + km
+        //   5) race countdown timer (bottom)
+        //
+        // Rows are spaced with equal gaps. The block is squeezed tight
+        // (small fixed gap) and centered vertically inside the donut
+        // window so the spacing looks balanced top-to-bottom.
         var donutInset = ringPen / 2 + 6;
-        var sumRows = hLoops + hHero + hStat + hProj + hClock;
-        var avail   = h - 2 * donutInset;
-        var gap     = (avail - sumRows) / 4;
-        if (gap < 0) { gap = 0; }
+        var rowGap     = 1;
+        var sumRows    = hClock + hStat + hProj + hLoops + hHero + 4 * rowGap;
+        var avail      = h - 2 * donutInset;
+        var topPad     = (avail - sumRows) / 2;
+        if (topPad < 0) { topPad = 0; }
 
-        var yTop   = donutInset;
-        var yHero  = yTop  + hLoops + gap;
-        var yStat  = yHero + hHero  + gap;
-        var yProj  = yStat + hStat  + gap;
-        var yClock = yProj + hProj  + gap;
+        var yClock = donutInset + topPad;        // row 1 (wall clock, top)
+        var yStat  = yClock + hClock + rowGap;   // row 2 (pa + avg pa)
+        var yProj  = yStat  + hStat  + rowGap;   // row 3 (est km)
+        var yLoops = yProj  + hProj  + rowGap;   // row 4 (loops + km)
+        var yHero  = yLoops + hLoops + rowGap;   // row 5 (countdown, bottom)
 
-        // Row 1: loops completed (blue; increases on each manual lap press).
+        // Row 1: real-time clock (uses fg so it adapts to bg).
+        dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
+        dc.drawText(cx, yClock, fClock, clockStr, Graphics.TEXT_JUSTIFY_CENTER);
+
+        // Row 2: loop pace + avg pace (support mode).
+        drawStatRow(dc, w, yStat, fSmall, fg);
+
+        // Row 3: projected km (dark green so it stands out from the
+        // fg-colored neighbour rows on both light and dark backgrounds).
+        dc.setColor(Graphics.COLOR_DK_GREEN, Graphics.COLOR_TRANSPARENT);
+        dc.drawText(cx, yProj, fProj, projStr, Graphics.TEXT_JUSTIFY_CENTER);
+
+        // Row 4: loops completed (blue; increases on each manual lap press).
         var loopsColor = (!_done && _completedLoops > 0 && _completedLoops % 10 == 0)
                        ? Graphics.COLOR_GREEN : Graphics.COLOR_BLUE;
         dc.setColor(loopsColor, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(cx, yTop, fLoops, loopsStr, Graphics.TEXT_JUSTIFY_CENTER);
+        dc.drawText(cx, yLoops, fLoops, loopsStr, Graphics.TEXT_JUSTIFY_CENTER);
 
-        // Row 2: race time remaining (countdown; uses fg so it adapts to bg).
+        // Row 5: race time remaining (countdown; uses fg so it adapts to bg).
         dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
         dc.drawText(cx, yHero, fHero, timeStr, Graphics.TEXT_JUSTIFY_CENTER);
 
-        // Row 3: loop pace + avg pace (support mode).
-        drawStatRow(dc, w, yStat, fSmall, fg);
-
-        // Row 4: projected km (uses fg so it adapts to bg).
-        dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(cx, yProj, fProj, projStr, Graphics.TEXT_JUSTIFY_CENTER);
-
-        // Row 5: real-time clock.
-        dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(cx, yClock, fClock, clockStr, Graphics.TEXT_JUSTIFY_CENTER);
+        // FUEL icon (support mode only): pops up below the race
+        // countdown when a scheduled carb serving is due and the next
+        // estimated loop end is within the configured lead time. Stays
+        // until the lap is logged.
+        if (_carbDueShow) {
+            drawFuelIcon(dc, cx, yHero + hHero + 2, fSmall);
+        }
 
         // Loop-number labels around the ring, drawn LAST so they sit on
         // top of any dots.
         drawLoopNumberLabels(dc, w, h, ringPen, ringCx, ringCy, fg);
+    }
+
+    // Draws an orange "FUEL Ng" pill just below a given y. N = grams per
+    // serving = carbsPerHourGrams / carbServingsPerHour, rounded to nearest int.
+    function drawFuelIcon(dc, cx, yTop, fStat) {
+        var perIntake = (_carbServingsPerHour > 0)
+                      ? ((_carbsPerHourGrams + (_carbServingsPerHour / 2)) / _carbServingsPerHour)
+                      : _carbsPerHourGrams;
+        var label = "FUEL " + perIntake.toString() + "g";
+        var tw    = dc.getTextWidthInPixels(label, fStat);
+        var th    = Graphics.getFontHeight(fStat);
+        var padX  = 6;
+        var padY  = 2;
+        var bw    = tw + 2 * padX;
+        var bh    = th + 2 * padY;
+        var bx    = cx - bw / 2;
+        var by    = yTop;
+        dc.setColor(Graphics.COLOR_ORANGE, Graphics.COLOR_TRANSPARENT);
+        dc.fillRoundedRectangle(bx, by, bw, bh, 6);
+        dc.setColor(Graphics.COLOR_WHITE, Graphics.COLOR_TRANSPARENT);
+        dc.drawText(cx, by + padY, fStat, label, Graphics.TEXT_JUSTIFY_CENTER);
     }
 
     // Fictive runners chase the loop at fixed paces (see
@@ -513,14 +648,48 @@ class UltraLoopTimerView extends WatchUi.DataField {
         dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
     }
 
-    // Blue dot for the *actual* runner in support mode. Position is
-    // discrete: it sits exactly on the tick of the most recently lapped
-    // loop (_completedLoops mod _loopsPerCircle) and only moves when the
-    // support presses the lap button. Lapped loop count is drawn in
-    // black on top of the dot.
+    // Blue dot for the *actual* runner in support mode. Slides smoothly
+    // within the current loop using the most recently lapped loop's
+    // duration as the pace estimate:
+    //   progressFrac = min((elapsedSec - lastLoopElapsedSec) / loopSec, 1.0)
+    //   ringFrac     = ((_completedLoops + progressFrac) / _loopsPerCircle) mod 1
+    // Before any lap has been pressed (first loop) the pace estimate is
+    // the YELLOW pace (midpoint of fast GREEN and slow RED). After an
+    // undo (which zeroes _lastLoopSec) the running average is used; if
+    // that is also unavailable we fall back to YELLOW. The dot is
+    // clamped at the next tick whenever progressFrac reaches 1.0, so
+    // it visibly waits there until the support presses the lap button.
+    // The completed-loop count is drawn in black on top.
     function drawActualRunnerDot(dc, w, h, ringPen, ringCx, ringCy, fg) {
         if (_loopsPerCircle <= 0) { return; }
-        var frac = _completedLoops.toFloat() / _loopsPerCircle.toFloat();
+
+        var loopKm = _loopMeters.toFloat() / 1000.0;
+        var loopSec;
+        var timeInLoop;
+        if (_completedLoops <= 0) {
+            // First loop: no measured pace yet -> YELLOW estimate.
+            loopSec    = YELLOW_SEC_PER_KM.toFloat() * loopKm;
+            timeInLoop = _elapsedSec.toFloat();
+        } else {
+            if (_lastLoopSec > 0) {
+                loopSec = _lastLoopSec.toFloat();
+            } else if (_avgLoopSec > 0) {
+                loopSec = _avgLoopSec.toFloat();
+            } else {
+                loopSec = YELLOW_SEC_PER_KM.toFloat() * loopKm;
+            }
+            timeInLoop = (_elapsedSec - _lastLoopElapsedSec).toFloat();
+        }
+        if (timeInLoop < 0.0) { timeInLoop = 0.0; }
+
+        var progress = 0.0;
+        if (loopSec > 0.0) {
+            progress = timeInLoop / loopSec;
+            if (progress > 1.0) { progress = 1.0; }   // clamp at next tick
+        }
+
+        var frac = (_completedLoops.toFloat() + progress)
+                 / _loopsPerCircle.toFloat();
         frac = frac - Math.floor(frac);
         var theta   = (90.0 - 360.0 * frac) * Math.PI / 180.0;
         var dotRad  = ringPen / 3;
@@ -616,7 +785,7 @@ class UltraLoopTimerView extends WatchUi.DataField {
     // Stat row: loop pa MM:SS   avg pa MM:SS   (both blue).
     // Support-mode only - runner mode renders its own hero stack.
     function drawStatRow(dc, w, yRow, fStat, fg) {
-        var loopPaceStr = "loop pa " + (_lastLoopSec > 0
+        var loopPaceStr = "pa " + (_lastLoopSec > 0
                           ? formatPace(loopSecToPaceMinPerKm(_lastLoopSec))
                           : "--:--");
         var avgPaceStr  = "avg pa " + (_avgLoopSec > 0
@@ -745,6 +914,17 @@ class UltraLoopTimerView extends WatchUi.DataField {
         return m.format("%d") + ":" + s.format("%02d");
     }
 
+    // Format a pace given as integer seconds-per-km as M:SS (e.g.
+    // 245 -> "4:05"). Used for the fictive pacer ring labels.
+    function formatSecPerKm(secPerKm) {
+        if (secPerKm == null || secPerKm <= 0) { return "--:--"; }
+        var s = secPerKm;
+        if (!(s instanceof Lang.Number)) { s = s.toNumber(); }
+        var m  = s / 60;
+        var ss = s % 60;
+        return m.format("%d") + ":" + ss.format("%02d");
+    }
+
     // Format a duration in seconds as M:SS.
     function fmtMmSs(secs) {
         var s = (secs == null) ? 0 : secs;
@@ -755,8 +935,6 @@ class UltraLoopTimerView extends WatchUi.DataField {
         return m.format("%d") + ":" + ss.format("%02d");
     }
 
-    // Runner-mode hero stack. Layout:
-    //   - top:    race time remaining HH:MM:SS    (small,  black)
     // Runner-mode hero stack. Layout:
     //   - top:    race time remaining HH:MM:SS    (small,  fg)
     //   - bottom: total distance "NN.NN km"       (small,  fg)
