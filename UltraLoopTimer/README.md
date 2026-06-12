@@ -86,14 +86,13 @@ Runner dots on the ring:
 
 | Dot | Color | Meaning | Pace |
 |-----|-------|---------|------|
-| Real runner | **blue** | slides smoothly within the current loop based on the previous loop's measured pace; **stops at the next tick** if the lap button is not pressed in time and resumes from there on the press | from lap presses |
+| Real runner | **blue** | sits at the ring tick of the most recently completed loop and **only jumps to the next tick when the lap button is pressed** | from lap presses |
 | Fictive 1   | **green** | fastest pacer | `raceSec / fastRunnerKm` (default 4:05 /km from 88 km in 6 h) |
 | Fictive 2   | **red**   | slowest pacer | `raceSec / slowRunnerKm` (default 4:30 /km from 80 km in 6 h) |
 
 A third **yellow** pacer is computed (midpoint of green and red) but
-has no dot on the ring. Its pace is used for (a) the first-loop slide
-estimate of the blue actual runner before any lap press, and (b) the
-silent every-loop crew vibe.
+has no dot on the ring. Its pace is used only for the silent
+every-loop crew vibe.
 
 Each dot has its **completed-loop count drawn in black** on top of the
 colored dot (readable on any face). Small **blue lap markers** sit on
@@ -107,7 +106,15 @@ Inside the ring (top to bottom), using fg for text rows that should
 adapt to background:
 
 - **Hero line** — total `completedLoops` and total distance in km.
-- **Loop pace + avg pace** — `loop pa M:SS  ·  avg pa M:SS` (blue).
+- **Loop pace + avg pace** — `pa M:SS/km  ·  avg M:SS/km` (blue).
+  Derived from the most recent / average loop duration and only
+  refreshed when the lap button is pressed. The `avg` value is
+  rendered one font size smaller, baseline-aligned to the right of
+  the live `pa`, so it reads as a secondary annotation.
+- **Loop time + avg loop time** — `lp M:SS/lp  ·  avg M:SS/lp` (blue).
+  Same source as the row above, expressed as raw loop time so the crew
+  can read both `min/km` pace and per-loop time after each lap press.
+  The `avg` value is also rendered one size smaller.
 - **Countdown** — race time remaining `HH:MM:SS` (fg).
 - **Projected km** — projection at finish (fg):
 
@@ -233,10 +240,9 @@ input it correctly shows `0:00 /km`, `0:00 /lp`, `avg 0:00 /lp` and
 `0.00 km`.
 
 Support mode also requires the simulator activity timer to be running
-(so `elapsedTime` ticks) for the green/red fictive pacer dots to move
-and for the blue actual-runner dot to slide between lap presses. Use
-the sim's lap-button shortcut to advance the blue dot to the next
-tick.
+(so `elapsedTime` ticks) for the green/red fictive pacer dots to move.
+The blue actual-runner dot only moves on lap-button presses - use the
+sim's lap-button shortcut to advance it to the next tick.
 
 ## Status
 
@@ -247,13 +253,12 @@ tick.
   the data-field background.
 - **Support mode** (default for `UltraLoop Support`): pacer-dot ring
   (green + red, paces derived from `fastRunnerKm` / `slowRunnerKm` and
-  `raceHours`), blue actual-runner dot that **slides within the
-  current loop** at the previous loop's pace and waits at the next
-  tick until the lap button is pressed, in-dot loop counts,
-  fastest-of-{blue,green} window advance, loop/avg/projection stats,
-  lap-burst correction, scheduled-carb FUEL alarm, and a silent
-  every-loop crew vibe at the midpoint (yellow) pace. Text rows also
-  auto-adapt to background.
+  `raceHours`), blue actual-runner dot that **sits at the most
+  recently completed loop tick and only jumps forward when the lap
+  button is pressed**, in-dot loop counts, fastest-of-{blue,green}
+  window advance, loop/avg/projection stats, lap-burst correction,
+  scheduled-carb FUEL alarm, and a silent every-loop crew vibe at the
+  midpoint (yellow) pace. Text rows also auto-adapt to background.
 - Supported devices: **fenix 7X**, **Forerunner 965**. Add more by
   appending `<iq:product id="..."/>` lines in both manifests once the
   layout has been verified on the target screen size.

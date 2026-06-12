@@ -13,11 +13,7 @@ using Toybox.WatchUi;
 //
 // The yellow pacer has no dot on the ring. Its pace is kept as
 // YELLOW_SEC_PER_KM (always the midpoint of GREEN and RED) and used
-// for two passive purposes:
-//   (a) first-loop pace estimate for the sliding blue actual-runner
-//       dot in support mode (before any lap press provides a real
-//       measured loop time),
-//   (b) the silent every-loop crew vibe.
+// for the silent every-loop crew vibe.
 var FICTIVE_PACES_SEC_PER_KM = [245, 270];
 var FICTIVE_PACE_LABELS      = ["4:05", "4:30"];
 var YELLOW_SEC_PER_KM = 258;
@@ -31,10 +27,10 @@ var YELLOW_SEC_PER_KM = 258;
 //              completed loop) times the configured loop length.
 //              Displays a sliding window of _loopsPerCircle loop ticks
 //              with two fictive pacers (green/red) and the blue actual
-//              runner dot, which slides smoothly inside the current
-//              loop based on the previous loop's measured pace and
-//              stops at the next tick if the lap button is not pressed
-//              in time. Plus lap-pace stats and a finish projection.
+//              runner dot, which sits at the tick of the most recently
+//              completed loop and only jumps forward when the support
+//              presses the lap button. Plus lap-pace stats and a
+//              finish projection.
 //   runner   - silent runner view. Distance comes from GPS
 //              (info.elapsedDistance). Shows a single blue dot sliding
 //              around the same _loopsPerCircle window plus a text
@@ -515,33 +511,38 @@ class UltraLoopTimerView extends WatchUi.DataField {
 
         // Row order top -> bottom:
         //   1) wall clock
-        //   2) pa + avg pa (stat row)
-        //   3) est km (projection)
-        //   4) loops + km
-        //   5) race countdown timer (bottom)
+        //   2) pa + avg pa  (per km, derived from loop times)
+        //   3) lp + avg lp  (per loop, raw loop times)
+        //   4) est km (projection)
+        //   5) loops + km
+        //   6) race countdown timer (bottom)
         //
         // Rows are spaced with equal gaps. The block is squeezed tight
         // (small fixed gap) and centered vertically inside the donut
         // window so the spacing looks balanced top-to-bottom.
         var donutInset = ringPen / 2 + 6;
         var rowGap     = 1;
-        var sumRows    = hClock + hStat + hProj + hLoops + hHero + 4 * rowGap;
+        var sumRows    = hClock + 2 * hStat + hProj + hLoops + hHero + 5 * rowGap;
         var avail      = h - 2 * donutInset;
         var topPad     = (avail - sumRows) / 2;
         if (topPad < 0) { topPad = 0; }
 
         var yClock = donutInset + topPad;        // row 1 (wall clock, top)
-        var yStat  = yClock + hClock + rowGap;   // row 2 (pa + avg pa)
-        var yProj  = yStat  + hStat  + rowGap;   // row 3 (est km)
-        var yLoops = yProj  + hProj  + rowGap;   // row 4 (loops + km)
-        var yHero  = yLoops + hLoops + rowGap;   // row 5 (countdown, bottom)
+        var yStat  = yClock + hClock + rowGap;   // row 2 (pa + avg pa, /km)
+        var yStat2 = yStat  + hStat  + rowGap;   // row 3 (lp + avg lp, /lp)
+        var yProj  = yStat2 + hStat  + rowGap;   // row 4 (est km)
+        var yLoops = yProj  + hProj  + rowGap;   // row 5 (loops + km)
+        var yHero  = yLoops + hLoops + rowGap;   // row 6 (countdown, bottom)
 
         // Row 1: real-time clock (uses fg so it adapts to bg).
         dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
         dc.drawText(cx, yClock, fClock, clockStr, Graphics.TEXT_JUSTIFY_CENTER);
 
-        // Row 2: loop pace + avg pace (support mode).
+        // Row 2: loop pace + avg pace (support mode, per km).
         drawStatRow(dc, w, yStat, fSmall, fg);
+
+        // Row 3: loop time + avg loop time (support mode, per loop).
+        drawLoopTimeRow(dc, w, yStat2, fSmall, fg);
 
         // Row 3: projected km (dark green so it stands out from the
         // fg-colored neighbour rows on both light and dark backgrounds).
@@ -648,47 +649,16 @@ class UltraLoopTimerView extends WatchUi.DataField {
         dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
     }
 
-    // Blue dot for the *actual* runner in support mode. Slides smoothly
-    // within the current loop using the most recently lapped loop's
-    // duration as the pace estimate:
-    //   progressFrac = min((elapsedSec - lastLoopElapsedSec) / loopSec, 1.0)
-    //   ringFrac     = ((_completedLoops + progressFrac) / _loopsPerCircle) mod 1
-    // Before any lap has been pressed (first loop) the pace estimate is
-    // the YELLOW pace (midpoint of fast GREEN and slow RED). After an
-    // undo (which zeroes _lastLoopSec) the running average is used; if
-    // that is also unavailable we fall back to YELLOW. The dot is
-    // clamped at the next tick whenever progressFrac reaches 1.0, so
-    // it visibly waits there until the support presses the lap button.
+    // Blue dot for the *actual* runner in support mode. Sits at the
+    // ring tick of the most recently completed loop and only jumps
+    // forward when the support presses the lap button - it does not
+    // slide smoothly with an estimated pace.
+    //   ringFrac = (_completedLoops / _loopsPerCircle) mod 1
     // The completed-loop count is drawn in black on top.
     function drawActualRunnerDot(dc, w, h, ringPen, ringCx, ringCy, fg) {
         if (_loopsPerCircle <= 0) { return; }
 
-        var loopKm = _loopMeters.toFloat() / 1000.0;
-        var loopSec;
-        var timeInLoop;
-        if (_completedLoops <= 0) {
-            // First loop: no measured pace yet -> YELLOW estimate.
-            loopSec    = YELLOW_SEC_PER_KM.toFloat() * loopKm;
-            timeInLoop = _elapsedSec.toFloat();
-        } else {
-            if (_lastLoopSec > 0) {
-                loopSec = _lastLoopSec.toFloat();
-            } else if (_avgLoopSec > 0) {
-                loopSec = _avgLoopSec.toFloat();
-            } else {
-                loopSec = YELLOW_SEC_PER_KM.toFloat() * loopKm;
-            }
-            timeInLoop = (_elapsedSec - _lastLoopElapsedSec).toFloat();
-        }
-        if (timeInLoop < 0.0) { timeInLoop = 0.0; }
-
-        var progress = 0.0;
-        if (loopSec > 0.0) {
-            progress = timeInLoop / loopSec;
-            if (progress > 1.0) { progress = 1.0; }   // clamp at next tick
-        }
-
-        var frac = (_completedLoops.toFloat() + progress)
+        var frac = _completedLoops.toFloat()
                  / _loopsPerCircle.toFloat();
         frac = frac - Math.floor(frac);
         var theta   = (90.0 - 360.0 * frac) * Math.PI / 180.0;
@@ -782,23 +752,48 @@ class UltraLoopTimerView extends WatchUi.DataField {
         dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
     }
 
-    // Stat row: loop pa MM:SS   avg pa MM:SS   (both blue).
+    // Stat row: loop pa MM:SS/km   avg MM:SS/km   (both blue).
     // Support-mode only - runner mode renders its own hero stack.
+    // Both values are derived from the most recent / average loop
+    // duration (which only updates after a lap-button press), so the
+    // pace estimate appears as soon as the first lap has been pressed.
     function drawStatRow(dc, w, yRow, fStat, fg) {
-        var loopPaceStr = "pa " + (_lastLoopSec > 0
-                          ? formatPace(loopSecToPaceMinPerKm(_lastLoopSec))
-                          : "--:--");
-        var avgPaceStr  = "avg pa " + (_avgLoopSec > 0
-                          ? formatPace(loopSecToPaceMinPerKm(_avgLoopSec))
-                          : "--:--");
+        var liveStr = "pa " + (_lastLoopSec > 0
+                      ? formatPace(loopSecToPaceMinPerKm(_lastLoopSec))
+                      : "--:--") + "/km";
+        var avgStr  = "avg " + (_avgLoopSec > 0
+                      ? formatPace(loopSecToPaceMinPerKm(_avgLoopSec))
+                      : "--:--") + "/km";
+        drawLiveAvgRow(dc, w, yRow, fStat, fg, liveStr, avgStr);
+    }
+
+    // Loop-time row: lp MM:SS/lp   avg MM:SS/lp   (both blue).
+    // Support-mode only. Values come from _lastLoopSec / _avgLoopSec,
+    // which are populated by lap-button presses (see finalizeBurst), so
+    // the loop time estimate appears as soon as the first lap is pressed.
+    function drawLoopTimeRow(dc, w, yRow, fStat, fg) {
+        var liveStr = "lp " + (_lastLoopSec > 0
+                      ? fmtMmSs(_lastLoopSec) : "--:--") + "/lp";
+        var avgStr  = "avg " + (_avgLoopSec > 0
+                      ? fmtMmSs(_avgLoopSec) : "--:--") + "/lp";
+        drawLiveAvgRow(dc, w, yRow, fStat, fg, liveStr, avgStr);
+    }
+
+    // Shared layout helper for the two blue "live + avg" stat rows.
+    // The live value is drawn at fStat, the avg value one size smaller
+    // (FONT_XTINY) and baseline-aligned to the right of the live value
+    // so it reads as a secondary annotation. The pair is centered.
+    function drawLiveAvgRow(dc, w, yRow, fStat, fg, liveStr, avgStr) {
+        var fAvg  = Graphics.FONT_XTINY;
         var gap   = 14;
-        var wL    = dc.getTextWidthInPixels(loopPaceStr, fStat);
-        var wA    = dc.getTextWidthInPixels(avgPaceStr,  fStat);
-        var total = wL + gap + wA;
-        var x0    = (w - total) / 2;
+        var wL    = dc.getTextWidthInPixels(liveStr, fStat);
+        var wA    = dc.getTextWidthInPixels(avgStr,  fAvg);
+        var x0    = (w - (wL + gap + wA)) / 2;
+        var yAvg  = yRow + (Graphics.getFontHeight(fStat)
+                          - Graphics.getFontHeight(fAvg));   // align baselines
         dc.setColor(Graphics.COLOR_BLUE, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(x0,           yRow, fStat, loopPaceStr, Graphics.TEXT_JUSTIFY_LEFT);
-        dc.drawText(x0 + wL + gap, yRow, fStat, avgPaceStr,  Graphics.TEXT_JUSTIFY_LEFT);
+        dc.drawText(x0,            yRow, fStat, liveStr, Graphics.TEXT_JUSTIFY_LEFT);
+        dc.drawText(x0 + wL + gap, yAvg, fAvg,  avgStr,  Graphics.TEXT_JUSTIFY_LEFT);
         dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
     }
 
