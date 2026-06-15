@@ -426,22 +426,17 @@ class UltraLoopTimerView extends WatchUi.DataField {
             _projectedKm    = 0.0;
         }
 
-        // Carb / fueling alert (support mode only, race not finished,
-        // need at least one completed loop so we have a pace estimate).
-        // Trigger the icon when we are "due" for the next scheduled
-        // serving AND the next estimated loop end is within the
-        // configured lead time, so the support crew can have the
-        // serving ready as the runner comes through the loop. The icon
-        // stays on screen and the alert fires once until the lap is
-        // registered.
+        // Carb / fueling alert (support mode only, race not finished).
+        // Servings are scheduled at every multiple of _carbsIntervalSec
+        // (= 3600 / carbServingsPerHour). The FUEL icon pops up
+        // _carbServingAlarmSec seconds before the next due serving and
+        // stays on screen until the next lap-button press, which counts
+        // the serving as taken and advances the schedule. This way a
+        // late-finishing loop still gets fueled on the upcoming lap.
         if (_supportMode && !_done && !_carbDueShow
-                && _carbServingsPerHour > 0 && _carbsIntervalSec > 0
-                && _completedLoops > 0 && _avgLoopSec > 0) {
-            var dueAt       = (_carbsGiven + 1) * _carbsIntervalSec;
-            var nextLoopEnd = _lastLoopElapsedSec + _avgLoopSec;
-            var secsToLoop  = nextLoopEnd - elapsed;
-            if (elapsed >= (dueAt - _carbServingAlarmSec)
-                    && secsToLoop >= 0 && secsToLoop <= _carbServingAlarmSec) {
+                && _carbServingsPerHour > 0 && _carbsIntervalSec > 0) {
+            var dueAt = (_carbsGiven + 1) * _carbsIntervalSec;
+            if (elapsed >= (dueAt - _carbServingAlarmSec)) {
                 _carbDueShow = true;
                 ringBell(2);
                 vibrateOnly(2);
@@ -476,93 +471,76 @@ class UltraLoopTimerView extends WatchUi.DataField {
             return;
         }
 
-        // Hero strings.
-        var loopsStr;
+        // Hero strings (support mode, top -> bottom):
+        //   row 1: loop count + current-loop stopwatch  "N  M:SS"
+        //   row 2: loop pace                             "M:SS/km"  (drawStatRow)
+        //   row 3: distance + projected end              "X.X / ~Y.Y km"
+        //   row 4: race countdown                        "HH:MM:SS"
+        var loopLineStr;
+        var distStr;
         var timeStr;
-        var projStr;
+        var inLoopSec = _elapsedSec - _lastLoopElapsedSec;
+        if (inLoopSec < 0) { inLoopSec = 0; }
         if (_done) {
-            loopsStr = "DONE";
-            timeStr  = "00:00:00";
+            loopLineStr = "DONE";
+            distStr     = "";
+            timeStr     = "00:00:00";
         } else {
             var doneKm = (_completedLoops * _loopMeters).toFloat() / 1000.0;
-            loopsStr = _completedLoops.toString() + " ("
-                     + doneKm.format("%.1f") + " km)";
+            loopLineStr = _completedLoops.toString() + "  " + fmtMmSs(inLoopSec);
+            distStr     = doneKm.format("%.1f");
+            if (_projectedKm > 0.0) {
+                distStr += " / ~" + _projectedKm.format("%.1f");
+            }
+            distStr += " km";
             timeStr  = fmtHmsAlways(_timeToFinish);
         }
-        projStr = "est " + (_projectedKm > 0.0 ? _projectedKm.format("%.1f") : "--.-") + " km";
 
-        var clock    = System.getClockTime();
-        var clockStr = clock.hour.format("%02d") + ":"
-                     + clock.min.format("%02d")  + ":"
-                     + clock.sec.format("%02d");
-
-        // Font sizes.
-        var fSmall   = Graphics.FONT_TINY;
-        var fLoops   = Graphics.FONT_SMALL;   // smaller than the rest for the loops row
-        var fClock   = Graphics.FONT_SMALL;
-        var fHero    = Graphics.FONT_SMALL;   // countdown clock; small, plain text font
-        var fProj    = Graphics.FONT_SMALL;   // est km row (smaller than before)
+        // Font sizes: three large rows + slightly smaller distance row.
+        var fSmall   = Graphics.FONT_XTINY;
+        var fPace    = Graphics.FONT_LARGE;
+        var fLoops   = Graphics.FONT_LARGE;
+        var fDist    = Graphics.FONT_MEDIUM;
+        var fHero    = Graphics.FONT_LARGE;
 
         var hLoops   = Graphics.getFontHeight(fLoops);
-        var hClock   = Graphics.getFontHeight(fClock);
+        var hDist    = Graphics.getFontHeight(fDist);
         var hHero    = Graphics.getFontHeight(fHero);
-        var hProj    = Graphics.getFontHeight(fProj);
-        var hStat    = Graphics.getFontHeight(fSmall);
+        var hPace    = Graphics.getFontHeight(fPace);
 
-        // Row order top -> bottom:
-        //   1) wall clock
-        //   2) pa + avg pa  (per km, derived from loop times)
-        //   3) lp + avg lp  (per loop, raw loop times)
-        //   4) est km (projection)
-        //   5) loops + km
-        //   6) race countdown timer (bottom)
-        //
         // Rows are spaced with equal gaps. The block is squeezed tight
         // (small fixed gap) and centered vertically inside the donut
         // window so the spacing looks balanced top-to-bottom.
         var donutInset = ringPen / 2 + 6;
         var rowGap     = 1;
-        var sumRows    = hClock + 2 * hStat + hProj + hLoops + hHero + 5 * rowGap;
+        var sumRows    = hLoops + hPace + hDist + hHero + 3 * rowGap;
         var avail      = h - 2 * donutInset;
         var topPad     = (avail - sumRows) / 2;
         if (topPad < 0) { topPad = 0; }
 
-        var yClock = donutInset + topPad;        // row 1 (wall clock, top)
-        var yStat  = yClock + hClock + rowGap;   // row 2 (pa + avg pa, /km)
-        var yStat2 = yStat  + hStat  + rowGap;   // row 3 (lp + avg lp, /lp)
-        var yProj  = yStat2 + hStat  + rowGap;   // row 4 (est km)
-        var yLoops = yProj  + hProj  + rowGap;   // row 5 (loops + km)
-        var yHero  = yLoops + hLoops + rowGap;   // row 6 (countdown, bottom)
+        var yLoops = donutInset + topPad;         // row 1 (loop count + stopwatch)
+        var yStat  = yLoops + hLoops + rowGap;    // row 2 (pace /km)
+        var yDist  = yStat  + hPace  + rowGap;    // row 3 (distance / projected)
+        var yHero  = yDist  + hDist  + rowGap;    // row 4 (countdown, bottom)
 
-        // Row 1: real-time clock (uses fg so it adapts to bg).
+        // Row 1: loop count + current-loop stopwatch (fg).
         dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(cx, yClock, fClock, clockStr, Graphics.TEXT_JUSTIFY_CENTER);
+        dc.drawText(cx, yLoops, fLoops, loopLineStr, Graphics.TEXT_JUSTIFY_CENTER);
 
-        // Row 2: loop pace + avg pace (support mode, per km).
-        drawStatRow(dc, w, yStat, fSmall, fg);
+        // Row 2: loop pace /km (support mode, large, fg).
+        drawStatRow(dc, w, yStat, fPace, fg);
 
-        // Row 3: loop time + avg loop time (support mode, per loop).
-        drawLoopTimeRow(dc, w, yStat2, fSmall, fg);
+        // Row 3: total distance + projected end distance (fg).
+        dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
+        dc.drawText(cx, yDist, fDist, distStr, Graphics.TEXT_JUSTIFY_CENTER);
 
-        // Row 3: projected km (dark green so it stands out from the
-        // fg-colored neighbour rows on both light and dark backgrounds).
-        dc.setColor(Graphics.COLOR_DK_GREEN, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(cx, yProj, fProj, projStr, Graphics.TEXT_JUSTIFY_CENTER);
-
-        // Row 4: loops completed (blue; increases on each manual lap press).
-        var loopsColor = (!_done && _completedLoops > 0 && _completedLoops % 10 == 0)
-                       ? Graphics.COLOR_GREEN : Graphics.COLOR_BLUE;
-        dc.setColor(loopsColor, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(cx, yLoops, fLoops, loopsStr, Graphics.TEXT_JUSTIFY_CENTER);
-
-        // Row 5: race time remaining (countdown; uses fg so it adapts to bg).
+        // Row 4: race time remaining (countdown; uses fg so it adapts to bg).
         dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
         dc.drawText(cx, yHero, fHero, timeStr, Graphics.TEXT_JUSTIFY_CENTER);
 
         // FUEL icon (support mode only): pops up below the race
-        // countdown when a scheduled carb serving is due and the next
-        // estimated loop end is within the configured lead time. Stays
-        // until the lap is logged.
+        // countdown when a scheduled carb serving is due. Stays on
+        // screen until the next lap-button press acknowledges it.
         if (_carbDueShow) {
             drawFuelIcon(dc, cx, yHero + hHero + 2, fSmall);
         }
@@ -752,49 +730,17 @@ class UltraLoopTimerView extends WatchUi.DataField {
         dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
     }
 
-    // Stat row: loop pa MM:SS/km   avg MM:SS/km   (both blue).
+    // Stat row: MM:SS/km (centered, fg).
     // Support-mode only - runner mode renders its own hero stack.
-    // Both values are derived from the most recent / average loop
-    // duration (which only updates after a lap-button press), so the
-    // pace estimate appears as soon as the first lap has been pressed.
+    // The value is derived from the most recent loop duration (which
+    // only updates after a lap-button press), so the pace estimate
+    // appears as soon as the first lap has been pressed.
     function drawStatRow(dc, w, yRow, fStat, fg) {
-        var liveStr = "pa " + (_lastLoopSec > 0
+        var liveStr = (_lastLoopSec > 0
                       ? formatPace(loopSecToPaceMinPerKm(_lastLoopSec))
                       : "--:--") + "/km";
-        var avgStr  = "avg " + (_avgLoopSec > 0
-                      ? formatPace(loopSecToPaceMinPerKm(_avgLoopSec))
-                      : "--:--") + "/km";
-        drawLiveAvgRow(dc, w, yRow, fStat, fg, liveStr, avgStr);
-    }
-
-    // Loop-time row: lp MM:SS/lp   avg MM:SS/lp   (both blue).
-    // Support-mode only. Values come from _lastLoopSec / _avgLoopSec,
-    // which are populated by lap-button presses (see finalizeBurst), so
-    // the loop time estimate appears as soon as the first lap is pressed.
-    function drawLoopTimeRow(dc, w, yRow, fStat, fg) {
-        var liveStr = "lp " + (_lastLoopSec > 0
-                      ? fmtMmSs(_lastLoopSec) : "--:--") + "/lp";
-        var avgStr  = "avg " + (_avgLoopSec > 0
-                      ? fmtMmSs(_avgLoopSec) : "--:--") + "/lp";
-        drawLiveAvgRow(dc, w, yRow, fStat, fg, liveStr, avgStr);
-    }
-
-    // Shared layout helper for the two blue "live + avg" stat rows.
-    // The live value is drawn at fStat, the avg value one size smaller
-    // (FONT_XTINY) and baseline-aligned to the right of the live value
-    // so it reads as a secondary annotation. The pair is centered.
-    function drawLiveAvgRow(dc, w, yRow, fStat, fg, liveStr, avgStr) {
-        var fAvg  = Graphics.FONT_XTINY;
-        var gap   = 14;
-        var wL    = dc.getTextWidthInPixels(liveStr, fStat);
-        var wA    = dc.getTextWidthInPixels(avgStr,  fAvg);
-        var x0    = (w - (wL + gap + wA)) / 2;
-        var yAvg  = yRow + (Graphics.getFontHeight(fStat)
-                          - Graphics.getFontHeight(fAvg));   // align baselines
-        dc.setColor(Graphics.COLOR_BLUE, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(x0,            yRow, fStat, liveStr, Graphics.TEXT_JUSTIFY_LEFT);
-        dc.drawText(x0 + wL + gap, yAvg, fAvg,  avgStr,  Graphics.TEXT_JUSTIFY_LEFT);
         dc.setColor(fg, Graphics.COLOR_TRANSPARENT);
+        dc.drawText(w / 2, yRow, fStat, liveStr, Graphics.TEXT_JUSTIFY_CENTER);
     }
 
     // Convert a per-loop duration (sec) to running pace in min/km.

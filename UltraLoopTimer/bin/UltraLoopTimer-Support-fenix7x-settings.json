@@ -131,7 +131,7 @@
   }, {
     "key" : "carbServingsPerHour",
     "valueType" : "number",
-    "defaultValue" : 6,
+    "defaultValue" : 12,
     "configTitle" : "CarbServingsTitle",
     "configPrompt" : "CarbServingsPrompt",
     "configType" : "numeric",

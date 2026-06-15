@@ -7,6 +7,6 @@
     <property id="fastRunnerKm"        type="float">88</property>
     <property id="slowRunnerKm"        type="float">80</property>
     <property id="carbsPerHourGrams"   type="number">90</property>
-    <property id="carbServingsPerHour" type="number">6</property>
+    <property id="carbServingsPerHour" type="number">12</property>
     <property id="carbServingAlarmSec" type="number">60</property>
 </properties>

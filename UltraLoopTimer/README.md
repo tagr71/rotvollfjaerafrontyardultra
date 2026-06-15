@@ -102,26 +102,30 @@ the ring for each loop the runner has completed in the current window
 A gentle vibe fires every **yellow-pace loop** — a passive
 "runner is at midpoint pace" cue for the crew.
 
-Inside the ring (top to bottom), using fg for text rows that should
-adapt to background:
+Inside the ring (top to bottom). All text rows use `fg`, which auto-
+adapts to the data-field background (**black on light**, **white on
+dark**):
 
-- **Hero line** — total `completedLoops` and total distance in km.
-- **Loop pace + avg pace** — `pa M:SS/km  ·  avg M:SS/km` (blue).
-  Derived from the most recent / average loop duration and only
-  refreshed when the lap button is pressed. The `avg` value is
-  rendered one font size smaller, baseline-aligned to the right of
-  the live `pa`, so it reads as a secondary annotation.
-- **Loop time + avg loop time** — `lp M:SS/lp  ·  avg M:SS/lp` (blue).
-  Same source as the row above, expressed as raw loop time so the crew
-  can read both `min/km` pace and per-loop time after each lap press.
-  The `avg` value is also rendered one size smaller.
-- **Countdown** — race time remaining `HH:MM:SS` (fg).
-- **Projected km** — projection at finish (fg):
+| Row | Value | Size |
+|-----|-------|------|
+| 1 | Loop count + current-loop stopwatch  `N  M:SS` | large |
+| 2 | Loop pace                              `M:SS/km` | large |
+| 3 | Distance + projected end               `X.X / ~Y.Y km` | medium |
+| 4 | Race countdown                         `HH:MM:SS` | large |
 
-  $$ \text{proj}\;\text{km} = \text{doneKm} + \frac{\text{remainingSec}}{\text{curLoopSec}} \cdot \frac{\text{loopMeters}}{1000} $$
+- The row-1 stopwatch counts up from the most recent lap-button press
+  (before any press: total elapsed time).
+- The pace row only refreshes when the lap button is pressed and is
+  derived from the duration of the most recently completed loop
+  (`paceMinPerKm = lastLoopSec / 60 × 1000 / loopMeters`). Before the
+  first lap press it shows `--:--/km`.
+- The `~Y.Y` projection on the distance row is the projected total at
+  finish:
 
-  where `curLoopSec = lastLoopSec` if known, otherwise `avgLoopSec`.
-- **Real-time clock** — wall clock `HH:MM:SS` (fg).
+  $$ \text{proj}\;\text{km} = \text{doneKm} + \frac{\text{remainingSec}}{\text{avgLoopSec}} \cdot \frac{\text{loopMeters}}{1000} $$
+
+  The `~Y.Y` segment is omitted before the first lap press, when there
+  is no pace estimate yet.
 
 ## Lap-press correction (support mode)
 
@@ -142,14 +146,18 @@ the press was registered.
 
 A scheduled-serving model: every hour is split into
 `carbServingsPerHour` evenly-spaced servings of
-`carbsPerHourGrams / carbServingsPerHour` grams each.
+`carbsPerHourGrams / carbServingsPerHour` grams each. Each serving has
+a fixed due time `dueAt = servingIndex × (3600 / carbServingsPerHour)`.
 
-When the next scheduled serving is due **and** the next estimated
-loop end is within `carbServingAlarmSec` seconds, an orange `FUEL Ng`
-pill is drawn below the countdown and a 2-bell + 2-vibe alert fires
-once. The pill stays on screen until the next lap-button press
-(normal or double press), which counts the serving as taken and clears
-the pill. An *undo* burst does **not** cancel an already-served carb.
+When `elapsed ≥ dueAt − carbServingAlarmSec` an orange `FUEL Ng` pill
+is drawn below the countdown and a 2-bell + 2-vibe alert fires once.
+The pill stays on screen until the next lap-button press (normal or
+double press), which counts the serving as taken and advances the
+schedule. An *undo* burst (3+ presses) does **not** cancel an already-
+served carb.
+
+Because the icon latches until acknowledged, a late-finishing loop
+still gets fueled on the upcoming lap.
 
 ## Other alerts (support mode)
 
@@ -172,7 +180,7 @@ In Garmin Connect → Connect IQ Apps → *UltraLoopTimer* or
 | `slowRunnerKm`         | 80      | 1 – 500   | RED pacer's total race-distance goal (km); clamped ≤ `fastRunnerKm` |
 | `carbsPerHourGrams`    | 90      | 0 – 200   | Total grams of carbs per hour |
 | `carbServingsPerHour`  | 6       | 1 – 30    | Servings per hour (so each serving = `grams / servings`) |
-| `carbServingAlarmSec`  | 60      | 10 – 600  | Lead time before the next estimated loop end at which the FUEL alarm fires |
+| `carbServingAlarmSec`  | 60      | 10 – 600  | Lead time (seconds) before each scheduled serving at which the FUEL alarm fires |
 
 The per-app `supportMode` defaults live in
 `resources-runner-default/settings/properties.xml` and
